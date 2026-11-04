@@ -1,14 +1,16 @@
-"""Runs against the real Qdrant, Ollama, Tesseract and Docling. Enable with RAG_INTEGRATION=1."""
+"""Runs against the real Qdrant, Ollama, Tesseract and Docling. Enable with RAG_INTEGRATION=1.
+
+The last test also needs PostgreSQL (RAG_TEST_DATABASE_URL) because it runs the real worker behind the real API.
+"""
 import os
-import subprocess
-import sys
+import threading
 import time
 import uuid
 
 import pytest
 from fastapi.testclient import TestClient
 
-from rag import answer, config, ingest, llm, store, worker
+from rag import answer, config, db, ingest, llm, storage, store, worker
 from rag.api import create_app
 from tests.fixtures.make_samples import CASES, UNANSWERABLE, make_bad_files, make_pdf, make_samples
 
@@ -23,16 +25,18 @@ def _require_services():
         pytest.skip(f"Qdrant/Ollama not reachable: {error}")
 
 
+def _supported(folder):
+    return sorted(p for p in folder.iterdir() if ingest.is_supported(p))
+
+
 @pytest.fixture(scope="session")
-def session_env(tmp_path_factory):
+def session_env():
     os.environ.setdefault("HF_HUB_OFFLINE", "1")  # models are cached; nothing should be downloaded in tests
     _require_services()
     mp = pytest.MonkeyPatch()
     collection = f"rag_it_{uuid.uuid4().hex[:8]}"
-    docs = tmp_path_factory.mktemp("documents")
     mp.setattr(config, "COLLECTION", collection)
-    mp.setattr(config, "DOCS_DIR", docs)
-    yield collection, docs
+    yield collection
     store.get_client().delete_collection(collection)
     mp.undo()
 
@@ -45,27 +49,24 @@ def pipeline():
 @pytest.fixture(scope="session")
 def index(session_env, pipeline, tmp_path_factory):
     """All sample documents indexed once and shared by the read-only tests."""
-    _, docs = session_env
-    incoming = tmp_path_factory.mktemp("incoming")
-    make_samples(incoming)
+    incoming = make_samples(tmp_path_factory.mktemp("incoming"))
     client = store.get_client()
     store.ensure_collection(client, lambda: len(llm.embed(["probe"])[0]))
-    paths, _ = ingest.import_into_documents(incoming)
     converter, chunker = pipeline
-    for path in paths:
+    files = _supported(incoming)
+    for path in files:
         assert ingest.index_file(client, converter, chunker, path) >= 1, path.name
-    return client, docs
+    return client, files
 
 
 @pytest.fixture
 def scratch(monkeypatch, tmp_path, pipeline):
-    """A private collection and documents folder for tests that change things."""
+    """A private collection and folder for tests that change things."""
     _require_services()
     collection = f"rag_it_{uuid.uuid4().hex[:8]}"
     docs = tmp_path / "documents"
     docs.mkdir()
     monkeypatch.setattr(config, "COLLECTION", collection)
-    monkeypatch.setattr(config, "DOCS_DIR", docs)
     client = store.get_client()
     store.ensure_collection(client, lambda: len(llm.embed(["probe"])[0]))
     yield client, docs, pipeline
@@ -96,11 +97,11 @@ def test_questions_the_documents_cannot_answer_get_not_found(index, question):
 
 
 def test_collection_has_payload_indexes_and_every_file_is_listed(index):
-    client, docs = index
+    client, files = index
     schema = client.get_collection(config.COLLECTION).payload_schema
     assert set(store.INDEXED_FIELDS) <= set(schema)
-    assert set(store.indexed_sources(client)) == {str(p) for p in worker.list_files()}
-    assert len(worker.list_files()) == len(CASES)
+    assert set(store.indexed_sources(client)) == {str(p) for p in files}
+    assert len(files) == len(CASES)
 
 
 # ---------- re-indexing behaviour ----------
@@ -119,6 +120,15 @@ def test_unchanged_files_are_skipped_and_changed_files_replaced(scratch):
     assert store.count_chunks(client, str(path)) == 1
 
 
+def test_the_index_is_keyed_by_the_given_source_not_the_path(scratch):
+    client, docs, (converter, chunker) = scratch
+    path = docs / "a.md"
+    path.write_text("# Reja\n\nMuddat 17-mart.\n", encoding="utf-8")
+    assert ingest.index_file(client, converter, chunker, path, source="doc-1") == 1
+    assert store.indexed_sources(client) == {"doc-1": 1}
+    assert [h.payload["file_name"] for h in answer.retrieve("Muddat qachon?", client)] == ["a.md"]
+
+
 def test_a_file_that_becomes_unreadable_keeps_its_old_chunks(scratch):
     client, docs, (converter, chunker) = scratch
     path = docs / "a.pdf"
@@ -134,66 +144,53 @@ def test_a_file_that_becomes_unreadable_keeps_its_old_chunks(scratch):
 def test_bad_files_fail_cleanly_and_never_reach_the_index(scratch, tmp_path):
     client, docs, (converter, chunker) = scratch
     bad = make_bad_files(tmp_path / "bad")
-    paths, problems = ingest.import_into_documents(bad)
-    assert [p.name for p, _ in problems] == ["21_eski.doc"]  # lock file is not even listed as a problem
-    for path in paths:
+    assert [p.name for p in bad.iterdir() if not ingest.is_supported(p)] == ["21_eski.doc", "~$03_vaqtinchalik.docx"]
+    for path in _supported(bad):
         with pytest.raises(Exception):  # noqa: B017
             ingest.index_file(client, converter, chunker, path)
     assert store.indexed_sources(client) == {}
 
 
-def test_purge_removes_index_entries_of_files_deleted_outside_the_app(scratch):
+def test_orphaned_index_entries_are_purged_but_known_documents_are_kept(scratch):
     client, docs, (converter, chunker) = scratch
-    keep, gone = docs / "keep.md", docs / "gone.md"
-    keep.write_text("# A\n\nbir\n", encoding="utf-8")
-    gone.write_text("# B\n\niki\n", encoding="utf-8")
-    for path in (keep, gone):
-        ingest.index_file(client, converter, chunker, path)
-    gone.unlink()
-    assert worker.purge_stale(client) == 1
-    assert set(store.indexed_sources(client)) == {str(keep)}
-
-
-def test_command_line_import_copies_into_documents_and_is_idempotent(scratch, tmp_path):
-    client, docs, _ = scratch
-    incoming = tmp_path / "incoming"
-    incoming.mkdir()
-    (incoming / "a.md").write_text("# Reja\n\nMuddat 17-mart.\n", encoding="utf-8")
-    env = {**os.environ, "RAG_COLLECTION": config.COLLECTION, "RAG_DOCS": str(docs), "PYTHONIOENCODING": "utf-8"}
-
-    def run():
-        return subprocess.run([sys.executable, "-m", "rag.ingest", str(incoming)], env=env,
-                              capture_output=True, text=True, encoding="utf-8", cwd=config.ROOT)
-
-    first, second = run(), run()
-    assert first.returncode == 0 and "INDEXED   a.md" in first.stdout, first.stdout + first.stderr
-    assert second.returncode == 0 and "UNCHANGED a.md" in second.stdout
-    assert (docs / "a.md").exists()  # visible to the web app, unlike before
-    assert set(store.indexed_sources(client)) == {str(docs / "a.md")}
+    for name in ("keep", "gone"):
+        path = docs / f"{name}.md"
+        path.write_text(f"# {name}\n\ntext of {name}\n", encoding="utf-8")
+        ingest.index_file(client, converter, chunker, path, source=f"id-{name}")
+    assert worker.purge_orphans(client, {"id-keep"}) == 1
+    assert set(store.indexed_sources(client)) == {"id-keep"}
 
 
 # ---------- the real worker behind the real API ----------
 
-def test_deleting_a_file_that_is_being_read_is_refused_then_works(scratch):
-    client, docs, _ = scratch
-    big = docs / "big.pdf"
-    make_pdf(big, pages=60, dense=True)
+def test_deleting_a_file_that_is_being_read_is_refused_then_works(scratch, storage_dir, request, tmp_path):
+    if not os.getenv("RAG_TEST_DATABASE_URL"):
+        pytest.skip("needs PostgreSQL: set RAG_TEST_DATABASE_URL")
+    request.getfixturevalue("database")
+    with db.pool().connection() as conn:
+        conn.execute("TRUNCATE documents")
+    client, _, (converter, chunker) = scratch
+    big = make_pdf(tmp_path / "big.pdf", pages=60, dense=True)
+
     with TestClient(create_app(), base_url=f"http://127.0.0.1:{config.PORT}") as web:
-        def state():
-            rows = {r["name"]: r for r in web.get("/api/documents").json()["documents"]}
-            return rows["big.pdf"]["state"]
+        upload = web.post("/api/documents", files=[("files", ("big.pdf", big.read_bytes()))])
+        assert upload.json()["results"][0]["accepted"]
+        doc_id = db.get_document("big.pdf")["id"]
+        real_worker = worker.Worker()
+        real_worker.client, real_worker.converter, real_worker.chunker = client, converter, chunker
+        thread = threading.Thread(target=real_worker.run_once)
+        thread.start()
 
         deadline = time.time() + 180
-        while state() != "processing":
+        while db.get_document("big.pdf")["state"] != "processing":
             assert time.time() < deadline, "the worker never started the file"
-            time.sleep(0.5)
+            time.sleep(0.2)
         assert web.delete("/api/documents/big.pdf").status_code == 409  # refused while it is being read
-        assert big.exists()
+        assert storage.path_for(doc_id, "big.pdf").exists()
 
-        while state() == "processing":
-            assert time.time() < deadline + 300, "indexing did not finish"
-            time.sleep(1)
-        assert state() == "done"
+        thread.join(timeout=600)
+        assert db.get_document("big.pdf")["state"] == "done"
+        assert store.count_chunks(client, str(doc_id)) >= 1
         assert web.delete("/api/documents/big.pdf").status_code == 200
-        assert not big.exists()
-        assert store.count_chunks(client, str(big)) == 0
+        assert not storage.path_for(doc_id, "big.pdf").exists()
+        assert store.count_chunks(client, str(doc_id)) == 0

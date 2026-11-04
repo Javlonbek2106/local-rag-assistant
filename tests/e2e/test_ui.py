@@ -1,6 +1,5 @@
 """Drives the real UI in Edge against a real server on a private port and collection. Enable with RAG_E2E=1."""
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -8,6 +7,8 @@ import time
 import urllib.request
 import uuid
 
+import httpx
+import psycopg
 import pytest
 
 from rag import config, store
@@ -23,14 +24,28 @@ def free_port():
         return s.getsockname()[1]
 
 
+def stop(proc):
+    """Stop the server and the worker it started (a plain terminate would leave the worker running)."""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+    else:
+        proc.terminate()
+    proc.wait(timeout=30)
+
+
 @pytest.fixture(scope="module")
 def server(tmp_path_factory):
+    """The whole app (`python -m rag`: API + worker) on a private port, database schema, folder and collection."""
+    database_url = os.getenv("RAG_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("needs PostgreSQL: set RAG_TEST_DATABASE_URL")
     samples = make_samples(tmp_path_factory.mktemp("samples"))
-    docs = tmp_path_factory.mktemp("documents")
-    for name in ("01_loyiha.md", "11_skan_rus.pdf", "02_ombor.docx"):
-        shutil.copy(samples / name, docs / name)
-    port, collection = free_port(), f"rag_e2e_{uuid.uuid4().hex[:8]}"
-    env = {**os.environ, "RAG_PORT": str(port), "RAG_COLLECTION": collection, "RAG_DOCS": str(docs),
+    port, suffix = free_port(), uuid.uuid4().hex[:8]
+    collection, schema = f"rag_e2e_{suffix}", f"rag_e2e_{suffix}"
+    with psycopg.connect(database_url, autocommit=True) as conn:
+        conn.execute(f"CREATE SCHEMA {schema}")
+    env = {**os.environ, "RAG_PORT": str(port), "RAG_COLLECTION": collection, "RAG_DATABASE_URL": database_url,
+           "RAG_DB_SCHEMA": schema, "RAG_STORAGE": str(tmp_path_factory.mktemp("storage")),
            "HF_HUB_OFFLINE": "1", "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.Popen([sys.executable, "-m", "rag"], env=env, cwd=config.ROOT,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -44,14 +59,21 @@ def server(tmp_path_factory):
             except OSError:
                 assert proc.poll() is None and time.time() < deadline, "server did not start"
                 time.sleep(1)
+        names = ("01_loyiha.md", "11_skan_rus.pdf", "02_ombor.docx")  # documents that exist before the page opens
+        httpx.post(f"{url}/api/documents", files=[("files", (n, (samples / n).read_bytes())) for n in names])
+        deadline = time.time() + 300
+        while any(d["state"] != "done" for d in httpx.get(f"{url}/api/documents").json()["documents"]):
+            assert time.time() < deadline, "the worker did not index the starting documents"
+            time.sleep(1)
         yield url, samples
     finally:
-        proc.terminate()
-        proc.wait(timeout=30)
+        stop(proc)
         try:
             store.get_client().delete_collection(collection)
         except Exception:  # noqa: BLE001 - cleanup must not hide the real failure
             pass
+        with psycopg.connect(database_url, autocommit=True) as conn:
+            conn.execute(f"DROP SCHEMA {schema} CASCADE")
 
 
 @pytest.fixture(scope="module")

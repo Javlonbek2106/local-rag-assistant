@@ -9,9 +9,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Vector store
+# Vector store. "documents_v2": chunks are keyed by document id (v1 used file paths and is no longer read).
 QDRANT_URL = os.getenv("RAG_QDRANT_URL", "http://127.0.0.1:6333")
-COLLECTION = os.getenv("RAG_COLLECTION", "documents")
+COLLECTION = os.getenv("RAG_COLLECTION", "documents_v2")
+
+# PostgreSQL: the durable record of documents and the indexing queue
+DATABASE_URL = os.getenv("RAG_DATABASE_URL", "postgresql://rag:rag@127.0.0.1:5433/rag")
+DB_SCHEMA = os.getenv("RAG_DB_SCHEMA")  # tests only: isolates a run in its own schema
+DB_POOL_SIZE = int(os.getenv("RAG_DB_POOL_SIZE", "5"))
+
+# Indexing jobs
+JOB_MAX_ATTEMPTS = int(os.getenv("RAG_JOB_MAX_ATTEMPTS", "3"))
+JOB_TIMEOUT_S = int(os.getenv("RAG_JOB_TIMEOUT_S", "1800"))  # one file may take at most this long
+JOB_HEARTBEAT_S = int(os.getenv("RAG_JOB_HEARTBEAT_S", "15"))
+JOB_STALE_AFTER_S = int(os.getenv("RAG_JOB_STALE_AFTER_S", "90"))  # no heartbeat for this long: worker is dead
+WORKER_POLL_S = float(os.getenv("RAG_WORKER_POLL_S", "1"))  # how often an idle worker looks for new documents
 
 # Models (served by Ollama; the Ollama client reads OLLAMA_HOST itself)
 EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "bge-m3")
@@ -29,7 +41,8 @@ MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.40"))
 # Indexing
 MAX_CHUNK_TOKENS = int(os.getenv("RAG_MAX_CHUNK_TOKENS", "512"))
 EMBED_BATCH = int(os.getenv("RAG_EMBED_BATCH", "32"))
-DOCS_DIR = Path(os.getenv("RAG_DOCS", ROOT / "documents")).resolve()
+# Uploaded files: <STORAGE_DIR>/<document id>/<original name>. The old `documents/` folder is no longer used.
+STORAGE_DIR = Path(os.getenv("RAG_STORAGE", ROOT / "storage")).resolve()
 MAX_UPLOAD_BYTES = int(os.getenv("RAG_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 EXTENSIONS = frozenset({
     ".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm", ".md", ".csv", ".txt",

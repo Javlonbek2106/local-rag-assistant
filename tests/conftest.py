@@ -1,51 +1,69 @@
 import os
+import uuid
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from rag import config, store
+from rag import config, db, store
 from rag.api import create_app
 
 
 def pytest_collection_modifyitems(config, items):
-    """Integration and e2e tests need real services; they only run when explicitly switched on."""
-    for marker, switch in (("integration", "RAG_INTEGRATION"), ("e2e", "RAG_E2E")):
-        if os.getenv(switch) == "1":
+    """Tests that need real services only run when switched on: integration/e2e with =1, db with a database URL."""
+    switches = (("integration", "RAG_INTEGRATION", "1"), ("e2e", "RAG_E2E", "1"), ("db", "RAG_TEST_DATABASE_URL", None))
+    for marker, switch, wanted in switches:
+        value = os.getenv(switch)
+        if value == wanted if wanted else bool(value):
             continue
-        skip = pytest.mark.skip(reason=f"set {switch}=1 to run")
+        skip = pytest.mark.skip(reason=f"set {switch}{'=' + wanted if wanted else ' to a PostgreSQL URL'} to run")
         for item in items:
             if marker in item.keywords:
                 item.add_marker(skip)
 
 
-class FakeWorker:
-    """Stands in for IndexWorker so API tests need no models and no threads."""
+class FakeRepo:
+    """In-memory stand-in for rag.db, so API tests need no PostgreSQL."""
+
+    Busy = db.Busy
 
     def __init__(self):
-        self.submitted = []
-        self.processing = set()
-        self.forgotten = []
-        self.status = {}
-        self.error = None
-        self.started = False
+        self.docs = {}  # name -> dict
+        self.migrated = False
 
-    def start(self):
-        self.started = True
+    def migrate(self):
+        self.migrated = True
 
-    def submit(self, name):
-        self.submitted.append(name)
+    def upsert_document(self, name, size_bytes):
+        found = self.docs.get(name)
+        if found and found["state"] == "processing":
+            raise db.Busy(name)
+        doc_id = found["id"] if found else uuid.uuid4()
+        self.docs[name] = {"id": doc_id, "name": name, "size_bytes": size_bytes, "state": "uploading",
+                           "chunks": None, "error": None, "seconds": None}
+        return doc_id
 
-    def is_processing(self, name):
-        return name in self.processing
+    def enqueue(self, doc_id):
+        for doc in self.docs.values():
+            if doc["id"] == doc_id and doc["state"] == "uploading":
+                doc["state"] = "queued"
+                return True
+        return False
 
-    def forget(self, name):
-        self.forgotten.append(name)
+    def list_documents(self):
+        return [self.docs[name] for name in sorted(self.docs)]
 
-    def queued(self):
-        return len(self.submitted)
+    def queue_length(self):
+        return sum(d["state"] in ("queued", "processing") for d in self.docs.values())
 
-    def snapshot(self):
-        return self.status
+    def delete_document(self, name):
+        found = self.docs.get(name)
+        if found is None:
+            return None
+        if found["state"] == "processing":
+            raise db.Busy(name)
+        del self.docs[name]
+        return found["id"]
 
 
 class FakeQdrant:
@@ -57,25 +75,45 @@ class FakeQdrant:
 
 
 @pytest.fixture
-def docs_dir(tmp_path, monkeypatch):
-    path = tmp_path / "documents"
-    monkeypatch.setattr(config, "DOCS_DIR", path)
+def storage_dir(tmp_path, monkeypatch):
+    path = tmp_path / "storage"
+    monkeypatch.setattr(config, "STORAGE_DIR", path)
     return path
 
 
 @pytest.fixture
-def worker():
-    return FakeWorker()
+def repo():
+    return FakeRepo()
 
 
 @pytest.fixture
 def qdrant(monkeypatch):
     fake = FakeQdrant()
     monkeypatch.setattr(store, "get_client", lambda: fake)
+    monkeypatch.setattr(store, "ensure_collection", lambda client, size: None)
     return fake
 
 
 @pytest.fixture
-def client(docs_dir, worker, qdrant):
-    with TestClient(create_app(worker), base_url=f"http://127.0.0.1:{config.PORT}") as test_client:
+def client(storage_dir, repo, qdrant):
+    with TestClient(create_app(repo), base_url=f"http://127.0.0.1:{config.PORT}") as test_client:
         yield test_client
+
+
+@pytest.fixture(scope="session")
+def database():
+    """A throw-away schema in the test database, migrated once and dropped at the end."""
+    url = os.environ["RAG_TEST_DATABASE_URL"]
+    schema = f"rag_test_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(f"CREATE SCHEMA {schema}")
+    mp = pytest.MonkeyPatch()
+    mp.setattr(config, "DATABASE_URL", url)
+    mp.setattr(config, "DB_SCHEMA", schema)
+    db.pool.cache_clear()
+    db.migrate()
+    yield schema
+    db.close()
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA {schema} CASCADE")
+    mp.undo()

@@ -16,4 +16,5 @@ addopts = "-ra"
 markers = [
     "integration: needs running Qdrant, Ollama, Tesseract and the parsing models (set RAG_INTEGRATION=1)",
     "e2e: drives the real UI in a browser (set RAG_E2E=1, needs Playwright and Edge)",
+    "db: needs a PostgreSQL server (set RAG_TEST_DATABASE_URL); runs in its own throw-away schema",
 ]

@@ -1,8 +1,8 @@
 """Parse documents, chunk them and store the chunks in Qdrant.
 
 Command line: python -m rag.ingest <folder>
-Copies the supported files into the documents folder (the single place the web app lists from)
-and indexes them. Unchanged files are skipped, changed files are replaced.
+Puts every supported file of the folder into the upload queue, exactly like an upload in the web page; the
+worker (started by `python -m rag`) does the indexing. Re-queued files that did not change are skipped by hash.
 """
 import hashlib
 import logging
@@ -13,9 +13,13 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 
-from rag import config, llm, store
+from rag import config, db, llm, storage, store
 
 log = logging.getLogger(__name__)
+
+
+class UnreadableDocument(ValueError):
+    """The file cannot be turned into text. Retrying will not help."""
 
 
 def is_supported(path):
@@ -61,7 +65,7 @@ def build_points(document, chunker, source, file_name, file_hash):
     chunks = list(chunker.chunk(document))
     texts = [chunker.contextualize(chunk) for chunk in chunks]
     if not any(text.strip() for text in texts):
-        raise ValueError("no text could be extracted")
+        raise UnreadableDocument("no text could be extracted")
 
     points = []
     for index, (chunk, text, vector) in enumerate(zip(chunks, texts, llm.embed(texts), strict=True)):
@@ -83,9 +87,12 @@ def build_points(document, chunker, source, file_name, file_hash):
     return points
 
 
-def index_file(client, converter, chunker, path):
-    """Return the number of chunks written, or None if this exact file version is already stored."""
-    source = str(path)
+def index_file(client, converter, chunker, path, source=None):
+    """Return the number of chunks written, or None if this exact file version is already stored.
+
+    `source` identifies the document in the index (the web app passes the document id; it defaults to the path).
+    """
+    source = source or str(path)
     with path.open("rb") as f:
         file_hash = hashlib.file_digest(f, "sha256").hexdigest()
     if store.is_indexed(client, source, file_hash):
@@ -97,23 +104,15 @@ def index_file(client, converter, chunker, path):
     return len(points)
 
 
-def import_into_documents(folder):
-    """Copy supported files from `folder` into the documents folder. Returns (paths, problems)."""
-    config.DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    paths, problems, seen = [], [], set()
-    for src in sorted(p for p in folder.rglob("*") if p.is_file() and not p.name.startswith("~$")):
-        if not is_supported(src):  # Office lock files (~$...) are skipped silently above
-            problems.append((src, "unsupported format"))
-            continue
-        if src.name in seen:
-            problems.append((src, "another file with the same name was already imported in this run"))
-            continue
-        seen.add(src.name)
-        dest = config.DOCS_DIR / src.name
-        if src.resolve() != dest:
-            shutil.copyfile(src, dest)
-        paths.append(dest)
-    return paths, problems
+def queue_file(name, temp_file, size, repo=db):
+    """Register a fully written temp file as a document and put it in the indexing queue. Returns the document id.
+
+    Raises db.Busy when a document with that name is being indexed right now.
+    """
+    doc_id = repo.upsert_document(name, size)
+    storage.save(doc_id, name, temp_file)
+    repo.enqueue(doc_id)
+    return doc_id
 
 
 def main(argv):
@@ -125,29 +124,31 @@ def main(argv):
     if not folder.is_dir():
         sys.exit(f"Not a folder: {folder}")
 
-    paths, problems = import_into_documents(folder)
-    client = store.get_client()
-    store.ensure_collection(client, lambda: len(llm.embed(["probe"])[0]))
-    converter, chunker = build_pipeline()
-
-    indexed, unchanged, failed = 0, 0, 0
-    for path in paths:
-        try:
-            count = index_file(client, converter, chunker, path)
-        except Exception as error:
-            failed += 1
-            print(f"FAILED    {path.name}: {error}")
-            continue
-        if count is None:
-            unchanged += 1
-            print(f"UNCHANGED {path.name}")
+    db.migrate()
+    storage.temp_dir().mkdir(parents=True, exist_ok=True)
+    queued, problems, seen = 0, [], set()
+    for src in sorted(p for p in folder.rglob("*") if p.is_file() and not p.name.startswith("~$")):
+        if not is_supported(src):  # Office lock files (~$...) are skipped silently above
+            problems.append((src, "unsupported format"))
+        elif src.name in seen:
+            problems.append((src, "another file with the same name was already queued in this run"))
         else:
-            indexed += 1
-            print(f"INDEXED   {path.name}: {count} chunks")
+            seen.add(src.name)
+            temp = storage.temp_dir() / uuid.uuid4().hex
+            try:
+                shutil.copyfile(src, temp)
+                queue_file(src.name, temp, src.stat().st_size)
+                queued += 1
+                print(f"QUEUED    {src.name}")
+            except db.Busy:
+                temp.unlink(missing_ok=True)
+                problems.append((src, "is being indexed right now, try again later"))
     for src, reason in problems:
         print(f"SKIPPED   {src.name}: {reason}")
-    print(f"\nindexed={indexed} unchanged={unchanged} failed={failed} skipped={len(problems)}")
-    sys.exit(1 if failed else 0)
+    print(f"\nqueued={queued} skipped={len(problems)}")
+    if queued:
+        print("Indexing happens in the worker (it runs with `python -m rag`); watch progress in the web page.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

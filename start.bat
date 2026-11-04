@@ -9,9 +9,9 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-docker compose up -d
+docker compose up -d --wait
 if errorlevel 1 (
-    echo Qdrant ishga tushmadi.
+    echo Qdrant yoki PostgreSQL ishga tushmadi.
     pause
     exit /b 1
 )
