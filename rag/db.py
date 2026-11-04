@@ -16,7 +16,10 @@ from rag import config
 log = logging.getLogger(__name__)
 MIGRATIONS = Path(__file__).parent / "migrations"
 MIGRATION_LOCK = 727001  # arbitrary key for pg_advisory_lock: api and worker may start at the same moment
-COLUMNS = "id, name, size_bytes, state, chunks, error, attempts, claimed_by, started_at, created_at, updated_at"
+COLUMNS = (
+    "id, name, size_bytes, state, chunks, error, attempts, claimed_by, started_at, created_at, updated_at, "
+    "CASE WHEN state = 'processing' THEN extract(epoch FROM now() - started_at)::int END AS seconds"
+)
 
 
 class Busy(Exception):
@@ -58,16 +61,16 @@ def migrate():
 # ---------- documents ----------
 
 def upsert_document(name, size_bytes):
-    """Create the document as queued, or reset the existing one for a re-upload. Returns its id.
+    """Create the document as 'uploading', or reset the existing one for a re-upload. Returns its id.
 
-    Raises Busy when that document is being indexed right now.
+    The caller saves the file and then calls enqueue(). Raises Busy when that document is being indexed right now.
     """
     with pool().connection() as conn:
         found = conn.execute(
             """
-            INSERT INTO documents (name, size_bytes, state) VALUES (%s, %s, 'queued')
+            INSERT INTO documents (name, size_bytes, state) VALUES (%s, %s, 'uploading')
             ON CONFLICT (name) DO UPDATE SET
-                size_bytes = EXCLUDED.size_bytes, state = 'queued', chunks = NULL, error = NULL, attempts = 0,
+                size_bytes = EXCLUDED.size_bytes, state = 'uploading', chunks = NULL, error = NULL, attempts = 0,
                 claimed_by = NULL, heartbeat_at = NULL, started_at = NULL, updated_at = now()
             WHERE documents.state <> 'processing'
             RETURNING id
@@ -77,6 +80,15 @@ def upsert_document(name, size_bytes):
     if found is None:
         raise Busy(name)
     return found["id"]
+
+
+def enqueue(doc_id):
+    """The file is saved: let workers take it. False if the document is no longer 'uploading'."""
+    with pool().connection() as conn:
+        return conn.execute(
+            "UPDATE documents SET state = 'queued', updated_at = now() WHERE id = %s AND state = 'uploading' "
+            "RETURNING id", (doc_id,),
+        ).fetchone() is not None
 
 
 def get_document(name):
@@ -161,9 +173,17 @@ def fail(doc_id, worker_id, error, retry=True):
     return row["state"] if row else None
 
 
-def requeue_stale(stale_after_s):
-    """Take back documents whose worker stopped sending heartbeats. Returns how many were put back or given up."""
+def requeue_stale(stale_after_s, uploading_after_s=900):
+    """Take back documents whose worker stopped sending heartbeats, and fail uploads that never finished.
+
+    Returns how many documents were touched.
+    """
     with pool().connection() as conn:
+        abandoned = conn.execute(
+            "UPDATE documents SET state = 'failed', error = 'Yuklash tugamadi', updated_at = now() "
+            "WHERE state = 'uploading' AND updated_at < now() - make_interval(secs => %s) RETURNING id",
+            (uploading_after_s,),
+        ).fetchall()
         rows = conn.execute(
             """
             UPDATE documents SET
@@ -177,4 +197,6 @@ def requeue_stale(stale_after_s):
         ).fetchall()
     if rows:
         log.warning("took back %d document(s) from dead workers", len(rows))
-    return len(rows)
+    if abandoned:
+        log.warning("gave up on %d upload(s) that never finished", len(abandoned))
+    return len(rows) + len(abandoned)

@@ -1,8 +1,10 @@
 import json
 
 import pytest
+from fastapi.testclient import TestClient
 
-from rag import answer, config
+from rag import answer, config, storage
+from rag.api import create_app
 from tests.helpers import make_hit
 
 OWN_ORIGIN = f"http://127.0.0.1:{config.PORT}"
@@ -38,23 +40,13 @@ def test_security_headers_are_set(client):
 
 # ---------- startup ----------
 
-def test_startup_restores_queue_and_cleans_leftovers(docs_dir, worker, qdrant):
-    from fastapi.testclient import TestClient
-
-    from rag.api import create_app
-
-    docs_dir.mkdir(parents=True)
-    (docs_dir / "a.pdf").write_bytes(b"x")
-    (docs_dir / "b.docx").write_bytes(b"x")
-    (docs_dir / "~$lock.docx").write_bytes(b"x")
-    (docs_dir / "notes.exe").write_bytes(b"x")
-    (docs_dir / ".uploading").mkdir()
-    (docs_dir / ".uploading" / "half").write_bytes(b"x")
-    with TestClient(create_app(worker), base_url=f"http://127.0.0.1:{config.PORT}"):
+def test_startup_migrates_and_cleans_interrupted_uploads(storage_dir, repo, qdrant):
+    (storage_dir / ".uploading").mkdir(parents=True)
+    (storage_dir / ".uploading" / "half").write_bytes(b"x")
+    with TestClient(create_app(repo), base_url=OWN_ORIGIN):
         pass
-    assert worker.started
-    assert sorted(worker.submitted) == ["a.pdf", "b.docx"]
-    assert not (docs_dir / ".uploading" / "half").exists()
+    assert repo.migrated
+    assert not (storage_dir / ".uploading" / "half").exists()
 
 
 # ---------- upload ----------
@@ -63,60 +55,71 @@ def upload(client, name, content=b"hello"):
     return client.post("/api/documents", files=[("files", (name, content))]).json()["results"][0]
 
 
-def test_upload_saves_file_and_queues_it(client, worker, docs_dir):
-    result = upload(client, "qoidalar.txt", b"matn")
-    assert result == {"name": "qoidalar.txt", "accepted": True}
-    assert (docs_dir / "qoidalar.txt").read_bytes() == b"matn"
-    assert worker.submitted == ["qoidalar.txt"]
-    assert list((docs_dir / ".uploading").iterdir()) == []  # temp file was moved, not copied
+def test_upload_saves_the_file_by_id_and_queues_it(client, repo, storage_dir):
+    assert upload(client, "qoidalar.txt", b"matn") == {"name": "qoidalar.txt", "accepted": True}
+    doc = repo.docs["qoidalar.txt"]
+    assert doc["state"] == "queued" and doc["size_bytes"] == 4
+    assert storage.path_for(doc["id"], "qoidalar.txt").read_bytes() == b"matn"
+    assert list((storage_dir / ".uploading").iterdir()) == []  # the temp file was moved, not copied
 
 
-def test_upload_rejects_unsupported_and_empty(client, worker, docs_dir):
+def test_upload_rejects_unsupported_and_empty(client, repo):
     assert not upload(client, "virus.exe")["accepted"]
     assert not upload(client, "bosh.txt", b"")["accepted"]
-    assert worker.submitted == []
-    assert not (docs_dir / "virus.exe").exists()
+    assert repo.docs == {}
 
 
-def test_upload_rejects_oversized_file(client, monkeypatch, docs_dir):
+def test_upload_rejects_oversized_file(client, monkeypatch, repo, storage_dir):
     monkeypatch.setattr(config, "MAX_UPLOAD_BYTES", 10)
     result = upload(client, "katta.txt", b"x" * 11)
     assert not result["accepted"] and "MB" in result["error"]
-    assert not (docs_dir / "katta.txt").exists()
-    assert list((docs_dir / ".uploading").iterdir()) == []
+    assert repo.docs == {} and list((storage_dir / ".uploading").iterdir()) == []
 
 
-def test_upload_never_writes_outside_documents_folder(client, docs_dir):
+def test_upload_never_writes_outside_the_storage_folder(client, repo, storage_dir):
     result = upload(client, "../../escape.txt")
     assert result["name"] == "escape.txt"
-    assert (docs_dir / "escape.txt").exists()
-    assert not (docs_dir.parent / "escape.txt").exists()
+    assert storage.path_for(repo.docs["escape.txt"]["id"], "escape.txt").exists()
+    assert not (storage_dir.parent / "escape.txt").exists()
 
 
-def test_upload_is_refused_while_the_same_file_is_being_read(client, worker, docs_dir):
-    docs_dir.joinpath("a.txt").write_bytes(b"old")
-    worker.processing.add("a.txt")
+def test_upload_is_refused_while_the_same_file_is_being_read(client, repo, storage_dir):
+    upload(client, "a.txt", b"old")
+    repo.docs["a.txt"]["state"] = "processing"
     result = upload(client, "a.txt", b"new")
     assert not result["accepted"]
-    assert docs_dir.joinpath("a.txt").read_bytes() == b"old"
+    assert storage.path_for(repo.docs["a.txt"]["id"], "a.txt").read_bytes() == b"old"
+    assert list((storage_dir / ".uploading").iterdir()) == []  # the refused upload leaves no temp file
+
+
+def test_re_upload_replaces_the_file_but_keeps_the_document(client, repo):
+    upload(client, "a.txt", b"old")
+    doc_id = repo.docs["a.txt"]["id"]
+    upload(client, "a.txt", b"new")
+    assert repo.docs["a.txt"]["id"] == doc_id
+    assert storage.path_for(doc_id, "a.txt").read_bytes() == b"new"
 
 
 # ---------- delete ----------
 
-def test_delete_removes_file_and_index_entries(client, worker, docs_dir, qdrant):
-    docs_dir.joinpath("a.txt").write_bytes(b"x")
+def test_delete_removes_the_record_the_file_and_the_index_entries(client, repo, storage_dir, qdrant):
+    upload(client, "a.txt")
+    doc_id = repo.docs["a.txt"]["id"]
     assert client.delete("/api/documents/a.txt").status_code == 200
-    assert not docs_dir.joinpath("a.txt").exists()
-    assert len(qdrant.deleted_filters) == 1
-    assert qdrant.deleted_filters[0].must[0].match.value == str(docs_dir / "a.txt")
-    assert worker.forgotten == ["a.txt"]
+    assert "a.txt" not in repo.docs
+    assert not storage.path_for(doc_id, "a.txt").exists()
+    assert [f.must[0].match.value for f in qdrant.deleted_filters] == [str(doc_id)]  # the index is keyed by id
 
 
-def test_delete_is_refused_while_the_file_is_being_read(client, worker, docs_dir, qdrant):
-    docs_dir.joinpath("a.txt").write_bytes(b"x")
-    worker.processing.add("a.txt")
+def test_delete_is_refused_while_the_file_is_being_read(client, repo, qdrant):
+    upload(client, "a.txt")
+    repo.docs["a.txt"]["state"] = "processing"
     assert client.delete("/api/documents/a.txt").status_code == 409
-    assert docs_dir.joinpath("a.txt").exists()
+    assert "a.txt" in repo.docs and qdrant.deleted_filters == []
+
+
+def test_delete_of_an_unknown_document_is_harmless(client, qdrant):
+    assert client.delete("/api/documents/never.txt").status_code == 200
     assert qdrant.deleted_filters == []
 
 
@@ -126,16 +129,20 @@ def test_delete_rejects_unsupported_names(client):
 
 # ---------- listing ----------
 
-def test_listing_combines_disk_files_with_status(client, worker, docs_dir):
-    docs_dir.joinpath("a.txt").write_bytes(b"12345")
-    docs_dir.joinpath("b.txt").write_bytes(b"1")
-    worker.status = {"a.txt": {"state": "done", "chunks": 3, "error": None, "seconds": None}}
-    worker.error = "Ollama yo'q"
-    data = client.get("/api/documents").json()
-    rows = {row["name"]: row for row in data["documents"]}
+def test_listing_shows_state_chunks_and_time(client, repo):
+    upload(client, "a.txt")
+    upload(client, "b.txt")
+    repo.docs["a.txt"].update(state="done", chunks=3)
+    repo.docs["b.txt"].update(state="processing", seconds=12)
+    rows = {r["name"]: r for r in client.get("/api/documents").json()["documents"]}
     assert rows["a.txt"]["state"] == "done" and rows["a.txt"]["chunks"] == 3 and rows["a.txt"]["size"] == 5
-    assert rows["b.txt"]["state"] == "queued"  # on disk but not seen by the worker yet
-    assert data["error"] == "Ollama yo'q"
+    assert rows["b.txt"]["state"] == "processing" and rows["b.txt"]["seconds"] == 12
+    assert client.get("/api/documents").json()["queued"] == 1
+
+
+def test_a_document_that_is_still_uploading_is_shown_as_queued(client, repo):
+    repo.upsert_document("a.txt", 5)  # saved nowhere yet
+    assert client.get("/api/documents").json()["documents"][0]["state"] == "queued"
 
 
 # ---------- ask ----------

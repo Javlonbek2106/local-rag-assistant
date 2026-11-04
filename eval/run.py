@@ -181,7 +181,6 @@ def main():
         if args.limit:
             questions = questions[: args.limit]
         config.COLLECTION = f"rag_eval_{uuid.uuid4().hex[:8]}"
-        config.DOCS_DIR = docs
         client = store.get_client()
         store.ensure_collection(client, lambda: len(llm.embed(["probe"])[0]))
         try:

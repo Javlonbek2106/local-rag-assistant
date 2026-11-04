@@ -1,9 +1,10 @@
 -- Documents and the indexing job queue. A document row IS its job: state says where it is.
+-- 'uploading' means the file is still being saved: workers never take it until it becomes 'queued'.
 CREATE TABLE documents (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name          text NOT NULL,
     size_bytes    bigint NOT NULL,
-    state         text NOT NULL CHECK (state IN ('queued', 'processing', 'done', 'failed')),
+    state         text NOT NULL CHECK (state IN ('uploading', 'queued', 'processing', 'done', 'failed')),
     chunks        integer,
     error         text,
     attempts      integer NOT NULL DEFAULT 0,

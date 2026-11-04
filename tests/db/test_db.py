@@ -10,7 +10,10 @@ pytestmark = pytest.mark.db
 
 
 def make(name, size=10):
-    return db.upsert_document(name, size)
+    """A document whose file is saved and which is ready to be claimed."""
+    doc_id = db.upsert_document(name, size)
+    assert db.enqueue(doc_id)
+    return doc_id
 
 
 def row(name):
@@ -66,11 +69,36 @@ def test_concurrent_first_start_of_api_and_worker_migrates_exactly_once(monkeypa
 
 # ---------- documents ----------
 
-def test_upload_creates_a_queued_document():
-    doc_id = make("a.pdf", 123)
+def test_upload_creates_an_uploading_document_that_workers_cannot_take_yet():
+    doc_id = db.upsert_document("a.pdf", 123)
     found = row("a.pdf")
-    assert found["id"] == doc_id and found["state"] == "queued" and found["size_bytes"] == 123
+    assert found["id"] == doc_id and found["state"] == "uploading" and found["size_bytes"] == 123
     assert found["attempts"] == 0 and found["chunks"] is None
+    assert db.claim_next("w1") is None  # the file may still be half written
+    assert db.enqueue(doc_id)
+    assert db.claim_next("w1")["id"] == doc_id
+
+
+def test_enqueue_only_works_from_uploading():
+    doc_id = make("a.pdf")
+    assert not db.enqueue(doc_id)  # already queued
+    assert not db.enqueue(uuid.uuid4())  # unknown id
+
+
+def test_an_upload_that_never_finished_is_failed_but_a_fresh_one_is_left_alone():
+    stuck, fresh = db.upsert_document("stuck.pdf", 1), db.upsert_document("fresh.pdf", 1)
+    with db.pool().connection() as conn:
+        conn.execute("UPDATE documents SET updated_at = now() - interval '2 hours' WHERE id = %s", (stuck,))
+    assert db.requeue_stale(90) == 1
+    assert row("stuck.pdf")["state"] == "failed" and row("stuck.pdf")["error"] == "Yuklash tugamadi"
+    assert row("fresh.pdf")["state"] == "uploading" and fresh
+
+
+def test_a_processing_document_reports_how_long_it_has_been_running():
+    make("a.pdf")
+    assert row("a.pdf")["seconds"] is None
+    db.claim_next("w1")
+    assert row("a.pdf")["seconds"] >= 0
 
 
 def test_re_upload_resets_the_document_but_keeps_its_id():

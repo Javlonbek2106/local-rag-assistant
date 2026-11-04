@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rag import config, ingest, llm, store
+from rag import config, db, ingest, llm, store, worker
 
 
 def chunk(pages, headings=("H",)):
@@ -48,32 +48,60 @@ def test_build_points_keeps_pages_headings_and_stable_ids(monkeypatch):
     assert first[0].id != first[1].id
 
 
-def test_build_points_rejects_documents_without_text():
+def test_a_document_without_text_is_unreadable_not_a_temporary_failure():
     chunker = FakeChunker([chunk([1])], ["   "])
-    with pytest.raises(ValueError, match="no text"):
+    with pytest.raises(ingest.UnreadableDocument, match="no text"):
         ingest.build_points(None, chunker, "s", "a.png", "h")
 
 
-def test_import_copies_supported_files_and_reports_the_rest(tmp_path, docs_dir):
-    source = tmp_path / "incoming"
-    (source / "sub").mkdir(parents=True)
-    (source / "a.txt").write_bytes(b"a")
-    (source / "sub" / "b.pdf").write_bytes(b"b")
-    (source / "sub" / "a.txt").write_bytes(b"duplicate name")
-    (source / "old.doc").write_bytes(b"x")
-    paths, problems = ingest.import_into_documents(source)
-
-    assert sorted(p.name for p in paths) == ["a.txt", "b.pdf"]
-    assert (docs_dir / "a.txt").read_bytes() == b"a"
-    reasons = {p.name: reason for p, reason in problems}
-    assert "unsupported" in reasons["old.doc"] and "same name" in reasons["a.txt"]
+def test_purge_orphans_removes_only_entries_without_a_document(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(store, "indexed_sources", lambda client: {"id-1": 3, "id-2": 5, "id-gone": 2})
+    monkeypatch.setattr(store, "delete_source", lambda client, source: deleted.append(source))
+    assert worker.purge_orphans("client", {"id-1", "id-2"}) == 1
+    assert deleted == ["id-gone"]
 
 
-def test_import_does_not_copy_a_file_onto_itself(docs_dir):
-    docs_dir.mkdir(parents=True)
-    (docs_dir / "a.txt").write_bytes(b"a")
-    paths, problems = ingest.import_into_documents(docs_dir)
-    assert paths == [docs_dir / "a.txt"] and problems == []
+def test_purge_orphans_refuses_to_wipe_the_index_when_no_document_is_known(monkeypatch):
+    monkeypatch.setattr(store, "indexed_sources", lambda client: {"id-1": 3})
+    monkeypatch.setattr(store, "delete_source", lambda client, source: pytest.fail("must not delete"))
+    assert worker.purge_orphans("client", set()) == 0
+
+
+def test_queue_file_registers_stores_and_enqueues_in_that_order(tmp_path, storage_dir, repo):
+    temp = tmp_path / "upload.tmp"
+    temp.write_bytes(b"matn")
+    doc_id = ingest.queue_file("a.txt", temp, 4, repo)
+    assert repo.docs["a.txt"]["id"] == doc_id and repo.docs["a.txt"]["state"] == "queued"
+    assert (storage_dir / str(doc_id) / "a.txt").read_bytes() == b"matn"
+    assert not temp.exists()
+
+
+def test_queue_file_refuses_a_document_that_is_being_indexed(tmp_path, storage_dir, repo):
+    ingest.queue_file("a.txt", _temp(tmp_path, "one"), 3, repo)
+    repo.docs["a.txt"]["state"] = "processing"
+    with pytest.raises(db.Busy):
+        ingest.queue_file("a.txt", _temp(tmp_path, "two"), 3, repo)
+
+
+def _temp(tmp_path, name):
+    path = tmp_path / name
+    path.write_bytes(b"x")
+    return path
+
+
+def test_index_file_uses_the_given_source_instead_of_the_path(tmp_path, monkeypatch):
+    path = tmp_path / "a.txt"
+    path.write_text("matn", encoding="utf-8")
+    seen = []
+
+    def already_indexed(client, source, file_hash):
+        seen.append(source)
+        return True
+
+    monkeypatch.setattr(store, "is_indexed", already_indexed)
+    assert ingest.index_file(None, None, None, path, source="doc-123") is None
+    assert seen == ["doc-123"]
 
 
 class FakeCountClient:
