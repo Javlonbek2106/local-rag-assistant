@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"rag/api.py" = ["B008"]  # FastAPI's File(...) default is the documented idiom
+"rag/answer.py" = ["E501"]  # the prompt text is one long sentence per rule
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+markers = [
+    "integration: needs running Qdrant, Ollama, Tesseract and the parsing models (set RAG_INTEGRATION=1)",
+    "e2e: drives the real UI in a browser (set RAG_E2E=1, needs Playwright and Edge)",
+]
