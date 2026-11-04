@@ -172,7 +172,11 @@ def main():
     parser.add_argument("--set", required=True, dest="spec")
     parser.add_argument("--no-answer", action="store_true")
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--keep", action="store_true", help="keep the index afterwards and print its name")
+    parser.add_argument("--collection", help="use an index kept earlier with --keep (never deleted afterwards); "
+                                             "documents that changed or are missing are indexed, the rest skipped")
+    parser.add_argument("--no-index", action="store_true", help="with --collection: do not index at all")
+    parser.add_argument("--workers", type=int, default=1, help="index with this many processes at once")
     args = parser.parse_args()
     with_answer = not args.no_answer
 
@@ -180,12 +184,26 @@ def main():
         docs, questions = load_set(args.spec, work)
         if args.limit:
             questions = questions[: args.limit]
-        config.COLLECTION = f"rag_eval_{uuid.uuid4().hex[:8]}"
+        reuse = bool(args.collection)
+        config.COLLECTION = args.collection or f"rag_eval_{uuid.uuid4().hex[:8]}"
         client = store.get_client()
+        if reuse and not client.collection_exists(config.COLLECTION):
+            sys.exit(f"No such index: {config.COLLECTION}")
         store.ensure_collection(client, lambda: len(llm.embed(["probe"])[0]))
         try:
-            print(f"indexing {docs} ...")
-            timings, failures = index_documents(client, docs)
+            timings, failures = {}, {}
+            if args.no_index:
+                print(f"using the existing index {config.COLLECTION} as it is")
+            else:
+                print(f"indexing {docs} ... (index name: {config.COLLECTION})", flush=True)
+                if args.workers > 1:
+                    from eval.index_pool import index_all
+
+                    files = sorted((p for p in docs.iterdir() if p.is_file() and ingest.is_supported(p)),
+                                   key=lambda p: -p.stat().st_size)  # biggest first: no long tail at the end
+                    timings, failures = index_all(files, config.COLLECTION, args.workers)
+                else:
+                    timings, failures = index_documents(client, docs)
             records = []
             for i, case in enumerate(questions, 1):
                 records.append(evaluate_question(client, case, with_answer))
@@ -202,7 +220,9 @@ def main():
                                        ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"\nreport: {path}")
         finally:
-            if not args.keep:
+            if args.keep or reuse:
+                print(f"index kept: {config.COLLECTION}")
+            else:
                 client.delete_collection(config.COLLECTION)
 
 
