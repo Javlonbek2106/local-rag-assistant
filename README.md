@@ -63,6 +63,25 @@ $env:RAG_E2E = "1"; .\.venv\Scripts\python.exe -m pytest tests/e2e              
 
 CI (GitHub Actions) faqat unit testlar va lint ni ishga tushiradi, chunki qolganlariga modellar kerak.
 
+## Sifatni o'lchash
+
+```powershell
+.\.venv\Scripts\python.exe -m eval.run --set synthetic            # kod bilan yaratiladigan namunaviy hujjatlar
+.\.venv\Scripts\python.exe -m eval.run --set eval/sets/injection  # hujjat ichidagi yashirin buyruqlarga bo'ysunish
+.\.venv\Scripts\python.exe -m eval.run --set eval/data/meniki     # o'z hujjatlaringiz: docs/ va questions.jsonl
+```
+
+Qidiruv (to'g'ri fayl va parcha topilishi, sahifa), ball chegarasi, javob (fakt, manba, rad etish), tezlik hisoboti
+`eval/reports/` ga yoziladi. Savollar formati [eval/run.py](eval/run.py) boshida. `eval/data/` va `eval/reports/` git'ga
+kirmaydi, chunki ularda real hujjatlar bo'lishi mumkin.
+
+## Ma'lum xavf: hujjat ichidagi buyruqlar
+
+Hujjat matniga yashirilgan "javobga ... qo'shing" kabi buyruqlarga model ba'zan bo'ysunadi
+(`eval/sets/injection` da 4 tadan 3 tasida to'g'ri javob beradi). Bir necha prompt variantini sinadim, hech biri
+ishonchli yaxshilamadi. Ilova matnni faqat matn sifatida ko'rsatadi (havola, buyruq bajarish yo'q) va manbani ko'rsatadi,
+shuning uchun eng yomon holat noto'g'ri javob. Hujjatlarni faqat ishonchli foydalanuvchilar yuklasin.
+
 ## Xavfsizlik va cheklovlar
 
 - Ilova faqat `127.0.0.1` da tinglaydi, login yo'q: bitta kompyuter uchun mo'ljallangan.

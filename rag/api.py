@@ -133,9 +133,9 @@ def create_app(worker=None):
             text = "".join(parts).strip()
             found = bool(hits) and answer.NOT_FOUND not in text
             sources = [
-                {"n": i, "file": h.payload["file_name"], "pages": h.payload["pages"],
+                {"n": n, "file": h.payload["file_name"], "pages": h.payload["pages"],
                  "score": round(h.score, 3), "text": h.payload["text"][:600]}
-                for i, h in enumerate(hits, 1)
+                for n, h in answer.used_sources(text, hits)
             ] if found else []
             yield json.dumps({"final": text if found else answer.NOT_FOUND, "found": found, "sources": sources}) + "\n"
 

@@ -1,9 +1,11 @@
 """Retrieve the best chunks for a question and have the local LLM answer from them only."""
 import logging
+import re
 
 from rag import config, llm, store
 
 log = logging.getLogger(__name__)
+CITATION = re.compile(r"\[(\d+)\]")
 NOT_FOUND = "Hujjatlarda bu savolga javob topilmadi."
 
 SYSTEM_PROMPT = f"""Siz hujjatlar bo'yicha yordamchisiz. Faqat quyidagi "Kontekst" ichidagi ma'lumotga tayanib javob bering.
@@ -12,6 +14,27 @@ Qoidalar:
 - Ma'lumotni kontekstdan aynan ko'chiring: nom, raqam va sanani o'zgartirmang. O'zingizdan hech narsa qo'shmang.
 - Javobdan keyin foydalangan manbaning raqamini [1], [2] shaklida yozing.
 - Agar kontekstda javob bo'lmasa, faqat shu gapni yozing: {NOT_FOUND}"""
+
+
+def cited_indices(answer_text):
+    """The [n] source markers the model wrote, in order of first appearance, without duplicates."""
+    seen = []
+    for match in CITATION.finditer(answer_text):
+        n = int(match.group(1))
+        if n not in seen:
+            seen.append(n)
+    return seen
+
+
+def used_sources(answer_text, hits):
+    """(number, hit) pairs for the sources the answer really cites.
+
+    Numbers the model invented (outside the list) are ignored. If it cited nothing valid, we cannot tell
+    which source it used, so every retrieved source is returned rather than hiding the evidence.
+    """
+    numbered = list(enumerate(hits, 1))
+    cited = [n for n in cited_indices(answer_text) if 1 <= n <= len(hits)]
+    return [(n, h) for n, h in numbered if n in cited] or numbered
 
 
 def retrieve(question, client=None):

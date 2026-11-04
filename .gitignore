@@ -5,3 +5,7 @@ __pycache__/
 # user data and downloaded models: never commit
 documents/
 tessdata/
+
+# evaluation: real documents, questions and reports can be private
+eval/data/
+eval/reports/

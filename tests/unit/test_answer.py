@@ -54,6 +54,28 @@ def test_stream_answer_passes_the_built_messages_to_the_model(monkeypatch):
     assert seen == [answer.build_messages("savol", hits)]
 
 
+def test_cited_indices_are_ordered_and_deduplicated():
+    assert answer.cited_indices("javob [2] va [1], yana [2]") == [2, 1]
+    assert answer.cited_indices("manbasiz") == []
+
+
+def test_only_the_cited_sources_are_shown():
+    hits = [make_hit(text="bir"), make_hit(text="ikki"), make_hit(text="uch")]
+    used = answer.used_sources("Javob [3] va [1].", hits)
+    assert [(n, h.payload["text"]) for n, h in used] == [(1, "bir"), (3, "uch")]  # source numbers are kept
+
+
+def test_invented_source_numbers_are_ignored():
+    hits = [make_hit(text="bir"), make_hit(text="ikki")]
+    assert [n for n, _ in answer.used_sources("Javob [7] va [2]", hits)] == [2]
+
+
+def test_without_any_valid_citation_every_retrieved_source_is_shown():
+    hits = [make_hit(text="bir"), make_hit(text="ikki")]
+    assert [n for n, _ in answer.used_sources("Javob manbasiz", hits)] == [1, 2]
+    assert [n for n, _ in answer.used_sources("Javob [9]", hits)] == [1, 2]
+
+
 @pytest.mark.parametrize("value", [0.0, 1.0])
 def test_threshold_is_configurable(monkeypatch, value):
     monkeypatch.setattr(config, "MIN_SCORE", value)

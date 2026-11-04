@@ -151,6 +151,14 @@ def test_ask_streams_tokens_then_final_with_sources(client, monkeypatch):
     assert final["sources"] == [{"n": 1, "file": "a.txt", "pages": [2], "score": 0.8, "text": "Lola-5G"}]
 
 
+def test_ask_shows_only_the_sources_the_answer_cites(client, monkeypatch):
+    hits = [make_hit(0.8, "a.txt", "birinchi"), make_hit(0.7, "b.txt", "ikkinchi"), make_hit(0.6, "c.txt", "uchinchi")]
+    monkeypatch.setattr(answer, "retrieve", lambda q: hits)
+    monkeypatch.setattr(answer, "stream_answer", lambda q, h: iter(["Javob [2]"]))
+    final = ndjson(client.post("/api/ask", json={"question": "?"}))[-1]
+    assert [(s["n"], s["file"]) for s in final["sources"]] == [(2, "b.txt")]
+
+
 def test_ask_without_relevant_chunks_says_not_found_and_shows_no_sources(client, monkeypatch):
     monkeypatch.setattr(answer, "retrieve", lambda q: [])
     final = ndjson(client.post("/api/ask", json={"question": "?"}))[-1]
