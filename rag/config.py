@@ -13,6 +13,17 @@ ROOT = Path(__file__).resolve().parent.parent
 QDRANT_URL = os.getenv("RAG_QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = os.getenv("RAG_COLLECTION", "documents")
 
+# PostgreSQL: the durable record of documents and the indexing queue
+DATABASE_URL = os.getenv("RAG_DATABASE_URL", "postgresql://rag:rag@127.0.0.1:5433/rag")
+DB_SCHEMA = os.getenv("RAG_DB_SCHEMA")  # tests only: isolates a run in its own schema
+DB_POOL_SIZE = int(os.getenv("RAG_DB_POOL_SIZE", "5"))
+
+# Indexing jobs
+JOB_MAX_ATTEMPTS = int(os.getenv("RAG_JOB_MAX_ATTEMPTS", "3"))
+JOB_TIMEOUT_S = int(os.getenv("RAG_JOB_TIMEOUT_S", "1800"))  # one file may take at most this long
+JOB_HEARTBEAT_S = int(os.getenv("RAG_JOB_HEARTBEAT_S", "15"))
+JOB_STALE_AFTER_S = int(os.getenv("RAG_JOB_STALE_AFTER_S", "90"))  # no heartbeat for this long: worker is dead
+
 # Models (served by Ollama; the Ollama client reads OLLAMA_HOST itself)
 EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "bge-m3")
 TOKENIZER = os.getenv("RAG_TOKENIZER", "BAAI/bge-m3")

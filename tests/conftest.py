@@ -8,11 +8,13 @@ from rag.api import create_app
 
 
 def pytest_collection_modifyitems(config, items):
-    """Integration and e2e tests need real services; they only run when explicitly switched on."""
-    for marker, switch in (("integration", "RAG_INTEGRATION"), ("e2e", "RAG_E2E")):
-        if os.getenv(switch) == "1":
+    """Tests that need real services only run when switched on: integration/e2e with =1, db with a database URL."""
+    switches = (("integration", "RAG_INTEGRATION", "1"), ("e2e", "RAG_E2E", "1"), ("db", "RAG_TEST_DATABASE_URL", None))
+    for marker, switch, wanted in switches:
+        value = os.getenv(switch)
+        if value == wanted if wanted else bool(value):
             continue
-        skip = pytest.mark.skip(reason=f"set {switch}=1 to run")
+        skip = pytest.mark.skip(reason=f"set {switch}{'=' + wanted if wanted else ' to a PostgreSQL URL'} to run")
         for item in items:
             if marker in item.keywords:
                 item.add_marker(skip)

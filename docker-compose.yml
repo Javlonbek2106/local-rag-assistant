@@ -9,5 +9,24 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5433:5432" # localhost only; 5433 so it never clashes with another local Postgres
+    environment:
+      # Development defaults. Real secrets come with the deployment work (plan, stage 5).
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   qdrant_data:
+  pg_data:
