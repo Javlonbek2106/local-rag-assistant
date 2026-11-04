@@ -1,0 +1,154 @@
+"""Parse documents, chunk them and store the chunks in Qdrant.
+
+Command line: python -m rag.ingest <folder>
+Copies the supported files into the documents folder (the single place the web app lists from)
+and indexes them. Unchanged files are skipped, changed files are replaced.
+"""
+import hashlib
+import logging
+import os
+import shutil
+import sys
+import uuid
+from io import BytesIO
+from pathlib import Path
+
+from rag import config, llm, store
+
+log = logging.getLogger(__name__)
+
+
+def is_supported(path):
+    return path.suffix.lower() in config.EXTENSIONS and not path.name.startswith("~$")
+
+
+def build_pipeline():
+    """Load the heavy parsing models once. Imported here so the rest of the package stays light."""
+    from docling.chunking import HybridChunker
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
+    from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
+    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+    from transformers import AutoTokenizer
+
+    os.environ["TESSDATA_PREFIX"] = str(config.TESSDATA)  # Docling's language check ignores the `path` option
+    pipeline = PdfPipelineOptions(
+        ocr_options=TesseractCliOcrOptions(lang=config.OCR_LANGS, tesseract_cmd=config.TESSERACT)
+    )
+    converter = DocumentConverter(format_options={
+        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline),
+        InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline),
+    })
+    tokenizer = HuggingFaceTokenizer(
+        tokenizer=AutoTokenizer.from_pretrained(config.TOKENIZER),
+        max_tokens=config.MAX_CHUNK_TOKENS,
+    )
+    return converter, HybridChunker(tokenizer=tokenizer)
+
+
+def convert(converter, path):
+    if path.suffix.lower() == ".txt":  # Docling has no plain-text input; Markdown parses it fine
+        from docling.datamodel.base_models import DocumentStream
+
+        stream = DocumentStream(name=f"{path.stem}.md", stream=BytesIO(path.read_bytes()))
+        return converter.convert(stream).document
+    return converter.convert(path).document
+
+
+def build_points(document, chunker, source, file_name, file_hash):
+    from qdrant_client import models
+
+    chunks = list(chunker.chunk(document))
+    texts = [chunker.contextualize(chunk) for chunk in chunks]
+    if not any(text.strip() for text in texts):
+        raise ValueError("no text could be extracted")
+
+    points = []
+    for index, (chunk, text, vector) in enumerate(zip(chunks, texts, llm.embed(texts), strict=True)):
+        pages = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov})
+        points.append(models.PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{file_hash}:{index}")),
+            vector=vector,
+            payload={
+                "source": source,
+                "file_name": file_name,
+                "file_hash": file_hash,
+                "chunk_index": index,
+                "chunks_total": len(chunks),
+                "pages": pages,
+                "headings": chunk.meta.headings or [],
+                "text": text,
+            },
+        ))
+    return points
+
+
+def index_file(client, converter, chunker, path):
+    """Return the number of chunks written, or None if this exact file version is already stored."""
+    source = str(path)
+    with path.open("rb") as f:
+        file_hash = hashlib.file_digest(f, "sha256").hexdigest()
+    if store.is_indexed(client, source, file_hash):
+        return None
+    points = build_points(convert(converter, path), chunker, source, path.name, file_hash)
+    # Old chunks go only after the new ones are embedded, so a parse or embed failure keeps them.
+    store.delete_source(client, source)
+    client.upload_points(config.COLLECTION, points=points, batch_size=64, wait=True)
+    return len(points)
+
+
+def import_into_documents(folder):
+    """Copy supported files from `folder` into the documents folder. Returns (paths, problems)."""
+    config.DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    paths, problems, seen = [], [], set()
+    for src in sorted(p for p in folder.rglob("*") if p.is_file() and not p.name.startswith("~$")):
+        if not is_supported(src):  # Office lock files (~$...) are skipped silently above
+            problems.append((src, "unsupported format"))
+            continue
+        if src.name in seen:
+            problems.append((src, "another file with the same name was already imported in this run"))
+            continue
+        seen.add(src.name)
+        dest = config.DOCS_DIR / src.name
+        if src.resolve() != dest:
+            shutil.copyfile(src, dest)
+        paths.append(dest)
+    return paths, problems
+
+
+def main(argv):
+    sys.stdout.reconfigure(encoding="utf-8")
+    logging.basicConfig(level=logging.WARNING)
+    if len(argv) != 2:
+        sys.exit("Usage: python -m rag.ingest <folder>")
+    folder = Path(argv[1]).resolve()
+    if not folder.is_dir():
+        sys.exit(f"Not a folder: {folder}")
+
+    paths, problems = import_into_documents(folder)
+    client = store.get_client()
+    store.ensure_collection(client, lambda: len(llm.embed(["probe"])[0]))
+    converter, chunker = build_pipeline()
+
+    indexed, unchanged, failed = 0, 0, 0
+    for path in paths:
+        try:
+            count = index_file(client, converter, chunker, path)
+        except Exception as error:
+            failed += 1
+            print(f"FAILED    {path.name}: {error}")
+            continue
+        if count is None:
+            unchanged += 1
+            print(f"UNCHANGED {path.name}")
+        else:
+            indexed += 1
+            print(f"INDEXED   {path.name}: {count} chunks")
+    for src, reason in problems:
+        print(f"SKIPPED   {src.name}: {reason}")
+    print(f"\nindexed={indexed} unchanged={unchanged} failed={failed} skipped={len(problems)}")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

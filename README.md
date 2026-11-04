@@ -30,13 +30,43 @@ Copy-Item "C:\Program Files\Tesseract-OCR\tessdata\configs" tessdata\configs -Re
 
 ## Ishga tushirish
 
-`start.bat` ni oching: Qdrant ko'tariladi, ilova ishga tushadi va brauzer ochiladi.
-Hujjatlar `documents/` papkasida saqlanadi (git'ga kirmaydi).
+`start.bat` ni oching: Qdrant ko'tariladi, ilova ishga tushadi va brauzer ochiladi (`python -m rag`).
+Hujjatlar `documents/` papkasida saqlanadi (git'ga kirmaydi). Sahifada ko'rinadigan hujjatlar shu papkadagilar.
 
-Papkadagi hujjatlarni terminaldan yuklash: `.\.venv\Scripts\python.exe ingest.py <papka>`
+Papkadagi hujjatlarni terminaldan qo'shish: `.\.venv\Scripts\python.exe -m rag.ingest <papka>`
+(fayllar `documents/` ga nusxalanadi va indekslanadi).
+
+## Sozlamalar
+
+Hammasi [rag/config.py](rag/config.py) da, `RAG_*` muhit o'zgaruvchilari bilan almashtiriladi:
+`RAG_QDRANT_URL`, `RAG_COLLECTION`, `RAG_LLM`, `RAG_EMBED_MODEL`, `RAG_TOP_K`, `RAG_MIN_SCORE`, `RAG_DOCS`, `RAG_PORT`,
+`RAG_MAX_UPLOAD_MB`, `RAG_TESSERACT`, `RAG_TESSDATA`.
+
+## Tuzilma
+
+```
+rag/config.py   sozlamalar          rag/store.py   Qdrant bilan ishlash
+rag/ingest.py   o'qish, bo'laklash  rag/llm.py     Ollama (embedding, javob)
+rag/answer.py   qidiruv va javob    rag/worker.py  fonda indekslash navbati
+rag/api.py      veb API             static/        sahifa
+```
+
+## Testlar
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest                       # unit testlar: xizmatlar kerak emas, bir necha soniya
+$env:RAG_INTEGRATION = "1"; .\.venv\Scripts\python.exe -m pytest tests/integration   # haqiqiy Qdrant + Ollama + Tesseract
+$env:RAG_E2E = "1"; .\.venv\Scripts\python.exe -m pytest tests/e2e                   # brauzerda (Edge) butun oqim
+.\.venv\Scripts\python.exe -m ruff check .
+```
+
+CI (GitHub Actions) faqat unit testlar va lint ni ishga tushiradi, chunki qolganlariga modellar kerak.
 
 ## Xavfsizlik va cheklovlar
 
 - Ilova faqat `127.0.0.1` da tinglaydi, login yo'q: bitta kompyuter uchun mo'ljallangan.
 - GPU bo'lmasa, javob 2-30 soniya oladi (qwen2.5:7b CPU'da). Matnli PDF ~1 soniya/sahifa, skan ~4 soniya/sahifa.
 - `.doc` fayllar o'qilmaydi (avval `.docx` ga o'tkazing). Tesseract ba'zi kirill harflarni adashtiradi.
+- Indekslash holati xotirada saqlanadi: ilova qayta ishga tushsa, `documents/` dagi fayllar qayta tekshiriladi
+  (o'zgarmaganlari tez o'tkaziladi).

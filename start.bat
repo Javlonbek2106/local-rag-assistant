@@ -31,5 +31,5 @@ start "" cmd /c "timeout /t 8 /nobreak >nul & start http://127.0.0.1:8765"
 echo.
 echo Ilova: http://127.0.0.1:8765   (to'xtatish uchun shu oynani yoping)
 echo.
-".venv\Scripts\python.exe" app.py
+".venv\Scripts\python.exe" -m rag
 pause

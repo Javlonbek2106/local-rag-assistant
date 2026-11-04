@@ -1,15 +1,9 @@
 """Retrieve the best chunks for a question and have the local LLM answer from them only."""
-import os
+import logging
 
-import ollama
-from qdrant_client import QdrantClient
+from rag import config, llm, store
 
-QDRANT_URL = "http://127.0.0.1:6333"
-COLLECTION = os.getenv("RAG_COLLECTION", "documents")
-EMBED_MODEL = "bge-m3"
-LLM_MODEL = os.getenv("RAG_LLM", "qwen2.5:7b")
-TOP_K = 5
-MIN_SCORE = 0.40  # below this a chunk is unrelated noise (measured: relevant >= 0.47, unrelated <= 0.39)
+log = logging.getLogger(__name__)
 NOT_FOUND = "Hujjatlarda bu savolga javob topilmadi."
 
 SYSTEM_PROMPT = f"""Siz hujjatlar bo'yicha yordamchisiz. Faqat quyidagi "Kontekst" ichidagi ma'lumotga tayanib javob bering.
@@ -21,10 +15,13 @@ Qoidalar:
 
 
 def retrieve(question, client=None):
-    client = client or QdrantClient(url=QDRANT_URL)
-    vector = ollama.embed(model=EMBED_MODEL, input=[question]).embeddings[0]
-    hits = client.query_points(COLLECTION, query=vector, limit=TOP_K, with_payload=True).points
-    return [h for h in hits if h.score >= MIN_SCORE]
+    client = client or store.get_client()
+    vector = llm.embed([question])[0]
+    hits = client.query_points(config.COLLECTION, query=vector, limit=config.TOP_K, with_payload=True).points
+    kept = [h for h in hits if h.score >= config.MIN_SCORE]
+    log.info("retrieve: %d/%d chunks above %.2f, top score %.3f",
+             len(kept), len(hits), config.MIN_SCORE, hits[0].score if hits else 0.0)
+    return kept
 
 
 def build_messages(question, hits):
@@ -42,11 +39,4 @@ def stream_answer(question, hits):
     if not hits:
         yield NOT_FOUND
         return
-    stream = ollama.chat(
-        model=LLM_MODEL,
-        messages=build_messages(question, hits),
-        stream=True,
-        options={"temperature": 0, "num_ctx": 8192},
-    )
-    for piece in stream:
-        yield piece.message.content
+    yield from llm.chat_stream(build_messages(question, hits))
