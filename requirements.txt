@@ -1,0 +1,8 @@
+docling==2.146.0
+docling-core==2.105.0
+ollama==0.6.3
+qdrant-client==1.20.0
+transformers==5.22.1
+fastapi==0.162.0
+uvicorn==0.54.0
+python-multipart==0.0.33

@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+# user data and downloaded models: never commit
+documents/
+tessdata/

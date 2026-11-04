@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hujjatlar yordamchisi</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Hujjatlar yordamchisi</h1>
+    <span class="muted">Hamma narsa shu kompyuterda ishlaydi</span>
+  </header>
+  <div id="banner" class="banner" hidden></div>
+  <main>
+    <aside>
+      <h2>Hujjatlar</h2>
+      <label id="drop" class="drop" tabindex="0">
+        <input id="file-input" type="file" multiple hidden>
+        <strong>Fayllarni shu yerga tashlang</strong>
+        <span class="muted">yoki bosib tanlang<br>PDF, Word, Excel, PowerPoint, HTML, rasm, matn</span>
+      </label>
+      <div id="upload-msg" class="upload-msg" hidden></div>
+      <ul id="docs" class="docs"></ul>
+      <p id="docs-empty" class="muted" hidden>Hozircha hujjat yo'q.</p>
+    </aside>
+    <section class="chat">
+      <h2>Savol-javob</h2>
+      <div id="log" class="log" aria-live="polite">
+        <p id="hint" class="muted">Hujjatlar tayyor bo'lgach, savolingizni yozing. Javob faqat shu hujjatlardan olinadi va manbasi ko'rsatiladi.</p>
+      </div>
+      <form id="ask-form" class="ask">
+        <textarea id="question" rows="2" maxlength="2000" placeholder="Savolingizni yozing… (Enter — yuborish, Shift+Enter — yangi qator)" required></textarea>
+        <button id="send" type="submit">Yuborish</button>
+      </form>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
