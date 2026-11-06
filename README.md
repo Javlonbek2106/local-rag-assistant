@@ -99,7 +99,8 @@ shuning uchun eng yomon holat noto'g'ri javob. Hujjatlarni faqat ishonchli foyda
 ## Xavfsizlik va cheklovlar
 
 - Ilova faqat `127.0.0.1` da tinglaydi, login yo'q: bitta kompyuter uchun mo'ljallangan.
-- GPU bo'lmasa, javob 2-30 soniya oladi (qwen2.5:7b CPU'da). Matnli PDF ~1 soniya/sahifa, skan ~4 soniya/sahifa.
+- GPU bo'lmasa, javob 2-30 soniya oladi (qwen2.5:7b CPU'da). Oddiy matnli PDF ~1 soniya/sahifa, skan ~4 soniya/sahifa; jadvalli PDF (statistik byulleten kabi) 5-10 soniya/sahifa:
+  381 betlik byulleten ~30-50 daqiqa oladi.
 - `.doc` fayllar o'qilmaydi (avval `.docx` ga o'tkazing). Tesseract ba'zi kirill harflarni adashtiradi.
 - Worker jarayoni qattiq o'ldirilsa (masalan `taskkill /F` bilan faqat ilovaga qarshi), uning bolasi qolib ketishi mumkin.
   Konsol oynasini yopish ikkalasini ham to'xtatadi.
