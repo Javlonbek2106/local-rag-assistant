@@ -37,6 +37,11 @@ TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 # weakest correct hit scored 0.478, so this cannot separate them reliably; the LLM prompt is the second guard.
 # To be calibrated on a real evaluation set (plan, stage 1).
 MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.40"))
+# Cross-encoder that re-orders the vector hits (rag/rerank.py), e.g. "BAAI/bge-reranker-v2-m3". Off by default.
+# Measured with qwen2.5:7b on 78 real questions: right passage at rank 1 70% -> 83%, but answers did not improve
+# (fact in answer 80% -> 78%) and it costs about 10 s per question on a CPU. Worth re-checking with a stronger model.
+RERANK_MODEL = os.getenv("RAG_RERANK_MODEL", "")
+RERANK_CANDIDATES = int(os.getenv("RAG_RERANK_CANDIDATES", "15"))
 
 # Indexing
 MAX_CHUNK_TOKENS = int(os.getenv("RAG_MAX_CHUNK_TOKENS", "512"))

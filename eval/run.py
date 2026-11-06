@@ -58,14 +58,13 @@ def index_documents(client, docs):
 
 
 def evaluate_question(client, case, with_answer):
-    vector = llm.embed([case["q"]])[0]
-    hits = client.query_points(config.COLLECTION, query=vector, limit=DEEP_K, with_payload=True).points
+    hits = answer.search(case["q"], client, DEEP_K)  # the production search, only deeper
     files = [h.payload["file_name"] for h in hits]
     pages = [h.payload["pages"] for h in hits]
     texts = [h.payload["text"] for h in hits]
     answerable = case.get("answerable", True)
-    record = {"q": case["q"], "answerable": answerable, "top_score": round(hits[0].score, 3) if hits else 0.0,
-              "top_files": files[:3]}
+    top_score = round(max((h.score for h in hits), default=0.0), 3)
+    record = {"q": case["q"], "answerable": answerable, "top_score": top_score, "top_files": files[:3]}
     if answerable:
         facts = case.get("facts", [])
         record["file_rank"] = metrics.file_rank(files, case["file"])
@@ -74,7 +73,7 @@ def evaluate_question(client, case, with_answer):
             record["page_hit_5"] = metrics.page_hit(files, pages, case["file"], case["page"], 5)
     if with_answer:
         start = time.time()
-        used = answer.retrieve(case["q"], client)
+        used = answer.above_threshold(hits[: config.TOP_K])
         text = "".join(answer.stream_answer(case["q"], used)).strip()
         record["seconds"] = round(time.time() - start, 1)
         record["answer"] = text
@@ -224,7 +223,7 @@ def main():
             out = Path(__file__).parent / "reports"
             out.mkdir(exist_ok=True)
             path = out / f"{datetime.now():%Y%m%d-%H%M%S}-{Path(args.spec).name}.json"
-            names = ("EMBED_MODEL", "LLM_MODEL", "TOP_K", "MIN_SCORE", "MAX_CHUNK_TOKENS")
+            names = ("EMBED_MODEL", "LLM_MODEL", "TOP_K", "MIN_SCORE", "MAX_CHUNK_TOKENS", "RERANK_MODEL")
             settings = {k: getattr(config, k) for k in names}
             path.write_text(json.dumps({"settings": settings, "summary": summary, "index_seconds": timings,
                                         "failed_documents": failures, "questions": records},

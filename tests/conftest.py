@@ -22,6 +22,12 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(skip)
 
 
+@pytest.fixture(autouse=True)
+def no_reranker(monkeypatch):
+    """Unit tests must not load the cross-encoder model; tests that want re-ranking switch it on themselves."""
+    monkeypatch.setattr(config, "RERANK_MODEL", "")
+
+
 class FakeRepo:
     """In-memory stand-in for rag.db, so API tests need no PostgreSQL."""
 
