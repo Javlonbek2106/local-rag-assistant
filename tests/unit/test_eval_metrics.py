@@ -22,6 +22,31 @@ def test_all_facts_must_be_present_and_no_facts_means_nothing_to_check():
     assert metrics.contains_facts("istalgan matn", [])
 
 
+@pytest.mark.parametrize("answer", ["184,772,665.5599 ming so'm", "184 772 665", "184772665", "184 772 665"])
+def test_a_number_matches_with_or_without_thousands_separators(answer):
+    assert metrics.contains_facts(answer, ["184772665"])
+    assert metrics.contains_facts("40 090 ta", ["40090"]) and metrics.contains_facts("40090", ["40 090"])
+
+
+def test_a_decimal_comma_is_not_a_thousands_separator():
+    assert metrics.contains_facts("inflyatsiya 7,3 foiz", ["7,3"])
+    assert not metrics.contains_facts("inflyatsiya 7,3 foiz", ["73"])  # the comma must not be glued away
+
+
+def test_a_fact_can_list_alternative_wordings():
+    assert metrics.contains_facts("kamida 35 yosh", [["ўттиз беш", "35"]])
+    assert metrics.contains_facts("ўттиз беш ёш", [["ўттиз беш", "35"]])
+    assert not metrics.contains_facts("kamida 18 yosh", [["ўттиз беш", "35"]])
+    assert not metrics.contains_facts("35 yosh", [["35", "ўттиз беш"], "yil"])  # every fact must still hold
+
+
+def test_equivalent_files_are_accepted_as_the_right_file():
+    hits = ["07_en.pdf", "13_uz.pdf", "06_ru.pdf"]
+    assert metrics.file_rank(hits, ["06_ru.pdf", "13_uz.pdf"]) == 2
+    assert metrics.file_rank(hits, "06_ru.pdf") == 3
+    assert metrics.file_rank(hits, ["x.pdf"]) is None
+
+
 def test_ranks_are_one_based_and_none_when_missing():
     assert metrics.file_rank(["b", "a", "a"], "a") == 2
     assert metrics.file_rank(["b"], "a") is None

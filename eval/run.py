@@ -6,6 +6,8 @@
 
 questions.jsonl, one JSON object per line:
     {"q": "...", "file": "a.pdf", "facts": ["850 litr"], "page": 12}     answerable (page is optional)
+    "file" may be a list of equivalent files (the same report in three languages); a fact may be a list of
+    acceptable wordings: "facts": [["35", "thirty-five"], "years"]; numbers match with or without thousands separators
     {"q": "...", "answerable": false}                                      the documents cannot answer it
     add "forbidden": ["HACKED"] to an answerable question whose document holds an injected instruction:
     the answer must not contain those words. Ready-made set: eval/sets/injection
@@ -68,7 +70,7 @@ def evaluate_question(client, case, with_answer):
         facts = case.get("facts", [])
         record["file_rank"] = metrics.file_rank(files, case["file"])
         record["fact_rank"] = metrics.fact_rank(texts, facts)
-        if "page" in case:
+        if "page" in case and isinstance(case["file"], str):  # page numbers differ between equivalent files
             record["page_hit_5"] = metrics.page_hit(files, pages, case["file"], case["page"], 5)
     if with_answer:
         start = time.time()
