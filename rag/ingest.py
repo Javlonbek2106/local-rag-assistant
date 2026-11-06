@@ -28,12 +28,9 @@ def is_supported(path):
 
 def build_pipeline():
     """Load the heavy parsing models once. Imported here so the rest of the package stays light."""
-    from docling.chunking import HybridChunker
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
     from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
-    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
-    from transformers import AutoTokenizer
 
     os.environ["TESSDATA_PREFIX"] = str(config.TESSDATA)  # Docling's language check ignores the `path` option
     pipeline = PdfPipelineOptions(
@@ -43,11 +40,35 @@ def build_pipeline():
         InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline),
         InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline),
     })
+    return converter, build_chunker()
+
+
+def build_chunker(max_tokens=None, tables=None):
+    """The chunker alone (cheap compared to parsing). `tables` is "triplet" (one "row, column = value" sentence per
+    cell, Docling's default) or "markdown" (real table rows; a long table is split between rows and the header row
+    is repeated in every chunk). Defaults come from the configuration."""
+    from docling.chunking import HybridChunker
+    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+    from transformers import AutoTokenizer
+
     tokenizer = HuggingFaceTokenizer(
         tokenizer=AutoTokenizer.from_pretrained(config.TOKENIZER),
-        max_tokens=config.MAX_CHUNK_TOKENS,
+        max_tokens=max_tokens or config.MAX_CHUNK_TOKENS,
     )
-    return converter, HybridChunker(tokenizer=tokenizer)
+    if (tables or config.TABLE_FORMAT) == "markdown":
+        return HybridChunker(tokenizer=tokenizer, serializer_provider=_markdown_tables_provider())
+    return HybridChunker(tokenizer=tokenizer)
+
+
+def _markdown_tables_provider():
+    from docling_core.transforms.chunker.hierarchical_chunker import ChunkingDocSerializer, ChunkingSerializerProvider
+    from docling_core.transforms.serializer.markdown import MarkdownTableSerializer
+
+    class MarkdownTablesProvider(ChunkingSerializerProvider):
+        def get_serializer(self, doc):
+            return ChunkingDocSerializer(doc=doc, table_serializer=MarkdownTableSerializer())
+
+    return MarkdownTablesProvider()
 
 
 def convert(converter, path):

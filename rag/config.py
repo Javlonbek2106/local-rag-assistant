@@ -40,6 +40,7 @@ MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.40"))
 
 # Indexing
 MAX_CHUNK_TOKENS = int(os.getenv("RAG_MAX_CHUNK_TOKENS", "512"))
+TABLE_FORMAT = os.getenv("RAG_TABLE_FORMAT", "triplet")  # "triplet" or "markdown", see ingest.build_chunker
 EMBED_BATCH = int(os.getenv("RAG_EMBED_BATCH", "32"))
 # Uploaded files: <STORAGE_DIR>/<document id>/<original name>. The old `documents/` folder is no longer used.
 STORAGE_DIR = Path(os.getenv("RAG_STORAGE", ROOT / "storage")).resolve()
