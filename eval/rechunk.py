@@ -39,15 +39,18 @@ def main():
     for path in sorted(p for p in docs.iterdir() if p.is_file() and ingest.is_supported(p)):
         if prefixes and not path.name.startswith(prefixes):
             continue
-        cached = cache_path(docs, path.name)
-        if not cached.exists():
-            print(f"  no parsed copy of {path.name}, skipped", flush=True)
-            continue
         began = time.time()
-        document = DoclingDocument.load_from_json(cached)
         file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
         # the same source string the evaluation uses, so one index can be topped up by either tool
-        points = ingest.build_points(document, chunker, str(path), path.name, file_hash)
+        if path.suffix.lower() == ".xlsx":  # spreadsheets do not go through Docling at all
+            points = ingest.xlsx_points(path, str(path), file_hash)
+        else:
+            cached = cache_path(docs, path.name)
+            if not cached.exists():
+                print(f"  no parsed copy of {path.name}, skipped", flush=True)
+                continue
+            points = ingest.build_points(DoclingDocument.load_from_json(cached), chunker, str(path), path.name,
+                                         file_hash)
         store.delete_source(client, str(path))
         client.upload_points(config.COLLECTION, points=points, batch_size=64, wait=True)
         total += len(points)

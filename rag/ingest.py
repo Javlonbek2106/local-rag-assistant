@@ -80,18 +80,15 @@ def convert(converter, path):
     return converter.convert(path).document
 
 
-def build_points(document, chunker, source, file_name, file_hash):
+def _make_points(items, source, file_name, file_hash):
+    """`items` is one (text, pages, headings) per chunk. Embeds the texts and builds the Qdrant points."""
     from qdrant_client import models
 
-    chunks = list(chunker.chunk(document))
-    texts = [chunker.contextualize(chunk) for chunk in chunks]
-    if not any(text.strip() for text in texts):
+    if not any(text.strip() for text, _, _ in items):
         raise UnreadableDocument("no text could be extracted")
-
-    points = []
-    for index, (chunk, text, vector) in enumerate(zip(chunks, texts, llm.embed(texts), strict=True)):
-        pages = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov})
-        points.append(models.PointStruct(
+    vectors = llm.embed([text for text, _, _ in items])
+    return [
+        models.PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{file_hash}:{index}")),
             vector=vector,
             payload={
@@ -99,13 +96,32 @@ def build_points(document, chunker, source, file_name, file_hash):
                 "file_name": file_name,
                 "file_hash": file_hash,
                 "chunk_index": index,
-                "chunks_total": len(chunks),
+                "chunks_total": len(items),
                 "pages": pages,
-                "headings": chunk.meta.headings or [],
+                "headings": headings,
                 "text": text,
             },
-        ))
-    return points
+        )
+        for index, ((text, pages, headings), vector) in enumerate(zip(items, vectors, strict=True))
+    ]
+
+
+def build_points(document, chunker, source, file_name, file_hash):
+    chunks = list(chunker.chunk(document))
+    items = [
+        (chunker.contextualize(chunk),
+         sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}),
+         chunk.meta.headings or [])
+        for chunk in chunks
+    ]
+    return _make_points(items, source, file_name, file_hash)
+
+
+def xlsx_points(path, source, file_hash):
+    """Spreadsheets bypass Docling: it takes a sheet's title row for the column header (see rag/xlsx.py)."""
+    from rag import xlsx
+
+    return _make_points(xlsx.chunks(path), source, path.name, file_hash)
 
 
 def index_file(client, converter, chunker, path, source=None):
@@ -118,7 +134,10 @@ def index_file(client, converter, chunker, path, source=None):
         file_hash = hashlib.file_digest(f, "sha256").hexdigest()
     if store.is_indexed(client, source, file_hash):
         return None
-    points = build_points(convert(converter, path), chunker, source, path.name, file_hash)
+    if path.suffix.lower() == ".xlsx":
+        points = xlsx_points(path, source, file_hash)
+    else:
+        points = build_points(convert(converter, path), chunker, source, path.name, file_hash)
     # Old chunks go only after the new ones are embedded, so a parse or embed failure keeps them.
     store.delete_source(client, source)
     client.upload_points(config.COLLECTION, points=points, batch_size=64, wait=True)

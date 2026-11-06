@@ -174,6 +174,8 @@ def main():
     parser.add_argument("--set", required=True, dest="spec")
     parser.add_argument("--no-answer", action="store_true")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--only-files", help="comma-separated file name prefixes: ask only the questions about these "
+                                             "files (questions the documents cannot answer are left out)")
     parser.add_argument("--keep", action="store_true", help="keep the index afterwards and print its name")
     parser.add_argument("--collection", help="use an index kept earlier with --keep (never deleted afterwards); "
                                              "documents that changed or are missing are indexed, the rest skipped")
@@ -184,6 +186,13 @@ def main():
 
     with tempfile.TemporaryDirectory() as work:
         docs, questions = load_set(args.spec, work)
+        if args.only_files:
+            prefixes = tuple(args.only_files.split(","))
+            def files_of(q):
+                return [q["file"]] if isinstance(q["file"], str) else q["file"]
+
+            questions = [q for q in questions
+                         if q.get("answerable", True) and any(f.startswith(prefixes) for f in files_of(q))]
         if args.limit:
             questions = questions[: args.limit]
         reuse = bool(args.collection)
