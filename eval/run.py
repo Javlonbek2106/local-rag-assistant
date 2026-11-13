@@ -6,6 +6,8 @@
 
 questions.jsonl, one JSON object per line:
     {"q": "...", "file": "a.pdf", "facts": ["850 litr"], "page": 12}     answerable (page is optional)
+    "file" may be a list of equivalent files (the same report in three languages); a fact may be a list of
+    acceptable wordings: "facts": [["35", "thirty-five"], "years"]; numbers match with or without thousands separators
     {"q": "...", "answerable": false}                                      the documents cannot answer it
     add "forbidden": ["HACKED"] to an answerable question whose document holds an injected instruction:
     the answer must not contain those words. Ready-made set: eval/sets/injection
@@ -56,23 +58,22 @@ def index_documents(client, docs):
 
 
 def evaluate_question(client, case, with_answer):
-    vector = llm.embed([case["q"]])[0]
-    hits = client.query_points(config.COLLECTION, query=vector, limit=DEEP_K, with_payload=True).points
+    hits = answer.search(case["q"], client, DEEP_K)  # the production search, only deeper
     files = [h.payload["file_name"] for h in hits]
     pages = [h.payload["pages"] for h in hits]
     texts = [h.payload["text"] for h in hits]
     answerable = case.get("answerable", True)
-    record = {"q": case["q"], "answerable": answerable, "top_score": round(hits[0].score, 3) if hits else 0.0,
-              "top_files": files[:3]}
+    top_score = round(max((h.score for h in hits), default=0.0), 3)
+    record = {"q": case["q"], "answerable": answerable, "top_score": top_score, "top_files": files[:3]}
     if answerable:
         facts = case.get("facts", [])
         record["file_rank"] = metrics.file_rank(files, case["file"])
         record["fact_rank"] = metrics.fact_rank(texts, facts)
-        if "page" in case:
+        if "page" in case and isinstance(case["file"], str):  # page numbers differ between equivalent files
             record["page_hit_5"] = metrics.page_hit(files, pages, case["file"], case["page"], 5)
     if with_answer:
         start = time.time()
-        used = answer.retrieve(case["q"], client)
+        used = answer.above_threshold(hits[: config.TOP_K])
         text = "".join(answer.stream_answer(case["q"], used)).strip()
         record["seconds"] = round(time.time() - start, 1)
         record["answer"] = text
@@ -172,20 +173,47 @@ def main():
     parser.add_argument("--set", required=True, dest="spec")
     parser.add_argument("--no-answer", action="store_true")
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--only-files", help="comma-separated file name prefixes: ask only the questions about these "
+                                             "files (questions the documents cannot answer are left out)")
+    parser.add_argument("--keep", action="store_true", help="keep the index afterwards and print its name")
+    parser.add_argument("--collection", help="use an index kept earlier with --keep (never deleted afterwards); "
+                                             "documents that changed or are missing are indexed, the rest skipped")
+    parser.add_argument("--no-index", action="store_true", help="with --collection: do not index at all")
+    parser.add_argument("--workers", type=int, default=1, help="index with this many processes at once")
     args = parser.parse_args()
     with_answer = not args.no_answer
 
     with tempfile.TemporaryDirectory() as work:
         docs, questions = load_set(args.spec, work)
+        if args.only_files:
+            prefixes = tuple(args.only_files.split(","))
+            def files_of(q):
+                return [q["file"]] if isinstance(q["file"], str) else q["file"]
+
+            questions = [q for q in questions
+                         if q.get("answerable", True) and any(f.startswith(prefixes) for f in files_of(q))]
         if args.limit:
             questions = questions[: args.limit]
-        config.COLLECTION = f"rag_eval_{uuid.uuid4().hex[:8]}"
+        reuse = bool(args.collection)
+        config.COLLECTION = args.collection or f"rag_eval_{uuid.uuid4().hex[:8]}"
         client = store.get_client()
+        if reuse and not client.collection_exists(config.COLLECTION):
+            sys.exit(f"No such index: {config.COLLECTION}")
         store.ensure_collection(client, lambda: len(llm.embed(["probe"])[0]))
         try:
-            print(f"indexing {docs} ...")
-            timings, failures = index_documents(client, docs)
+            timings, failures = {}, {}
+            if args.no_index:
+                print(f"using the existing index {config.COLLECTION} as it is")
+            else:
+                print(f"indexing {docs} ... (index name: {config.COLLECTION})", flush=True)
+                if args.workers > 1:
+                    from eval.index_pool import index_all
+
+                    files = sorted((p for p in docs.iterdir() if p.is_file() and ingest.is_supported(p)),
+                                   key=lambda p: -p.stat().st_size)  # biggest first: no long tail at the end
+                    timings, failures = index_all(files, config.COLLECTION, args.workers)
+                else:
+                    timings, failures = index_documents(client, docs)
             records = []
             for i, case in enumerate(questions, 1):
                 records.append(evaluate_question(client, case, with_answer))
@@ -195,14 +223,16 @@ def main():
             out = Path(__file__).parent / "reports"
             out.mkdir(exist_ok=True)
             path = out / f"{datetime.now():%Y%m%d-%H%M%S}-{Path(args.spec).name}.json"
-            names = ("EMBED_MODEL", "LLM_MODEL", "TOP_K", "MIN_SCORE", "MAX_CHUNK_TOKENS")
+            names = ("EMBED_MODEL", "LLM_MODEL", "TOP_K", "MIN_SCORE", "MAX_CHUNK_TOKENS", "RERANK_MODEL")
             settings = {k: getattr(config, k) for k in names}
             path.write_text(json.dumps({"settings": settings, "summary": summary, "index_seconds": timings,
                                         "failed_documents": failures, "questions": records},
                                        ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"\nreport: {path}")
         finally:
-            if not args.keep:
+            if args.keep or reuse:
+                print(f"index kept: {config.COLLECTION}")
+            else:
                 client.delete_collection(config.COLLECTION)
 
 

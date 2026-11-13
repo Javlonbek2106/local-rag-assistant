@@ -28,12 +28,9 @@ def is_supported(path):
 
 def build_pipeline():
     """Load the heavy parsing models once. Imported here so the rest of the package stays light."""
-    from docling.chunking import HybridChunker
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
     from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
-    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
-    from transformers import AutoTokenizer
 
     os.environ["TESSDATA_PREFIX"] = str(config.TESSDATA)  # Docling's language check ignores the `path` option
     pipeline = PdfPipelineOptions(
@@ -43,11 +40,35 @@ def build_pipeline():
         InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline),
         InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline),
     })
+    return converter, build_chunker()
+
+
+def build_chunker(max_tokens=None, tables=None):
+    """The chunker alone (cheap compared to parsing). `tables` is "triplet" (one "row, column = value" sentence per
+    cell, Docling's default) or "markdown" (real table rows; a long table is split between rows and the header row
+    is repeated in every chunk). Defaults come from the configuration."""
+    from docling.chunking import HybridChunker
+    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+    from transformers import AutoTokenizer
+
     tokenizer = HuggingFaceTokenizer(
         tokenizer=AutoTokenizer.from_pretrained(config.TOKENIZER),
-        max_tokens=config.MAX_CHUNK_TOKENS,
+        max_tokens=max_tokens or config.MAX_CHUNK_TOKENS,
     )
-    return converter, HybridChunker(tokenizer=tokenizer)
+    if (tables or config.TABLE_FORMAT) == "markdown":
+        return HybridChunker(tokenizer=tokenizer, serializer_provider=_markdown_tables_provider())
+    return HybridChunker(tokenizer=tokenizer)
+
+
+def _markdown_tables_provider():
+    from docling_core.transforms.chunker.hierarchical_chunker import ChunkingDocSerializer, ChunkingSerializerProvider
+    from docling_core.transforms.serializer.markdown import MarkdownTableSerializer
+
+    class MarkdownTablesProvider(ChunkingSerializerProvider):
+        def get_serializer(self, doc):
+            return ChunkingDocSerializer(doc=doc, table_serializer=MarkdownTableSerializer())
+
+    return MarkdownTablesProvider()
 
 
 def convert(converter, path):
@@ -59,18 +80,15 @@ def convert(converter, path):
     return converter.convert(path).document
 
 
-def build_points(document, chunker, source, file_name, file_hash):
+def _make_points(items, source, file_name, file_hash):
+    """`items` is one (text, pages, headings) per chunk. Embeds the texts and builds the Qdrant points."""
     from qdrant_client import models
 
-    chunks = list(chunker.chunk(document))
-    texts = [chunker.contextualize(chunk) for chunk in chunks]
-    if not any(text.strip() for text in texts):
+    if not any(text.strip() for text, _, _ in items):
         raise UnreadableDocument("no text could be extracted")
-
-    points = []
-    for index, (chunk, text, vector) in enumerate(zip(chunks, texts, llm.embed(texts), strict=True)):
-        pages = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov})
-        points.append(models.PointStruct(
+    vectors = llm.embed([text for text, _, _ in items])
+    return [
+        models.PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{file_hash}:{index}")),
             vector=vector,
             payload={
@@ -78,13 +96,32 @@ def build_points(document, chunker, source, file_name, file_hash):
                 "file_name": file_name,
                 "file_hash": file_hash,
                 "chunk_index": index,
-                "chunks_total": len(chunks),
+                "chunks_total": len(items),
                 "pages": pages,
-                "headings": chunk.meta.headings or [],
+                "headings": headings,
                 "text": text,
             },
-        ))
-    return points
+        )
+        for index, ((text, pages, headings), vector) in enumerate(zip(items, vectors, strict=True))
+    ]
+
+
+def build_points(document, chunker, source, file_name, file_hash):
+    chunks = list(chunker.chunk(document))
+    items = [
+        (chunker.contextualize(chunk),
+         sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}),
+         chunk.meta.headings or [])
+        for chunk in chunks
+    ]
+    return _make_points(items, source, file_name, file_hash)
+
+
+def xlsx_points(path, source, file_hash):
+    """Spreadsheets bypass Docling: it takes a sheet's title row for the column header (see rag/xlsx.py)."""
+    from rag import xlsx
+
+    return _make_points(xlsx.chunks(path), source, path.name, file_hash)
 
 
 def index_file(client, converter, chunker, path, source=None):
@@ -97,7 +134,10 @@ def index_file(client, converter, chunker, path, source=None):
         file_hash = hashlib.file_digest(f, "sha256").hexdigest()
     if store.is_indexed(client, source, file_hash):
         return None
-    points = build_points(convert(converter, path), chunker, source, path.name, file_hash)
+    if path.suffix.lower() == ".xlsx":
+        points = xlsx_points(path, source, file_hash)
+    else:
+        points = build_points(convert(converter, path), chunker, source, path.name, file_hash)
     # Old chunks go only after the new ones are embedded, so a parse or embed failure keeps them.
     store.delete_source(client, source)
     client.upload_points(config.COLLECTION, points=points, batch_size=64, wait=True)

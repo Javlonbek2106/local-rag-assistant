@@ -3,6 +3,7 @@ import functools
 import logging
 
 from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from rag import config
 
@@ -18,11 +19,15 @@ def get_client():
 def ensure_collection(client, vector_size):
     """Create the collection if missing. `vector_size` is a callable, called only when a probe is needed."""
     if not client.collection_exists(config.COLLECTION):
-        client.create_collection(
-            config.COLLECTION,
-            vectors_config=models.VectorParams(size=vector_size(), distance=models.Distance.COSINE),
-        )
-        log.info("created collection %s", config.COLLECTION)
+        try:
+            client.create_collection(
+                config.COLLECTION,
+                vectors_config=models.VectorParams(size=vector_size(), distance=models.Distance.COSINE),
+            )
+            log.info("created collection %s", config.COLLECTION)
+        except UnexpectedResponse as error:
+            if error.status_code != 409:  # 409: the API and the worker started together and the other one won
+                raise
     # Without these indexes every per-file lookup scans the whole collection. Idempotent, also fixes old collections.
     for field in INDEXED_FIELDS:
         client.create_payload_index(config.COLLECTION, field, models.PayloadSchemaType.KEYWORD)

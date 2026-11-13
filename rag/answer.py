@@ -2,7 +2,7 @@
 import logging
 import re
 
-from rag import config, llm, store
+from rag import config, llm, rerank, store
 
 log = logging.getLogger(__name__)
 CITATION = re.compile(r"\[(\d+)\]")
@@ -37,14 +37,25 @@ def used_sources(answer_text, hits):
     return [(n, h) for n, h in numbered if n in cited] or numbered
 
 
-def retrieve(question, client=None):
-    client = client or store.get_client()
+def search(question, client, limit):
+    """The `limit` best chunks, best first: vector search, re-ordered by the cross-encoder when one is set."""
     vector = llm.embed([question])[0]
-    hits = client.query_points(config.COLLECTION, query=vector, limit=config.TOP_K, with_payload=True).points
+    if not config.RERANK_MODEL:
+        return client.query_points(config.COLLECTION, query=vector, limit=limit, with_payload=True).points
+    candidates = max(limit, config.RERANK_CANDIDATES)
+    hits = client.query_points(config.COLLECTION, query=vector, limit=candidates, with_payload=True).points
+    return rerank.rerank(question, hits)[:limit]
+
+
+def above_threshold(hits):
     kept = [h for h in hits if h.score >= config.MIN_SCORE]
     log.info("retrieve: %d/%d chunks above %.2f, top score %.3f",
-             len(kept), len(hits), config.MIN_SCORE, hits[0].score if hits else 0.0)
+             len(kept), len(hits), config.MIN_SCORE, max((h.score for h in hits), default=0.0))
     return kept
+
+
+def retrieve(question, client=None):
+    return above_threshold(search(question, client or store.get_client(), config.TOP_K))
 
 
 def build_messages(question, hits):

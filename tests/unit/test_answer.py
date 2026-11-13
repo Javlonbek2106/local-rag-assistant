@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rag import answer, config, llm
+from rag import answer, config, llm, rerank
 from tests.helpers import make_hit
 
 
@@ -22,6 +22,19 @@ def test_retrieve_drops_chunks_below_the_score_threshold(monkeypatch):
     kept = answer.retrieve("savol", client)
     assert [h.score for h in kept] == [0.9, 0.5]
     assert client.queries == [(config.COLLECTION, [0.1, 0.2], config.TOP_K)]
+
+
+def test_reranker_reorders_a_wider_candidate_list_and_keeps_top_k(monkeypatch):
+    monkeypatch.setattr(llm, "embed", lambda texts: [[0.1]])
+    monkeypatch.setattr(config, "RERANK_MODEL", "fake")
+    monkeypatch.setattr(config, "RERANK_CANDIDATES", 8)
+    monkeypatch.setattr(config, "TOP_K", 2)
+    hits = [make_hit(0.9, text="a"), make_hit(0.8, text="b"), make_hit(0.7, text="c")]
+    monkeypatch.setattr(rerank, "scores", lambda question, texts: [{"a": 0.1, "b": 0.2, "c": 0.9}[t] for t in texts])
+    client = FakeSearchClient(hits)
+    kept = answer.retrieve("savol", client)
+    assert [h.payload["text"] for h in kept] == ["c", "b"]  # best by the cross-encoder, cut to TOP_K
+    assert client.queries[0][2] == 8  # asked the index for the wider candidate list
 
 
 def test_retrieve_handles_an_empty_index(monkeypatch):

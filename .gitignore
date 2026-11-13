@@ -9,3 +9,6 @@ tessdata/
 # evaluation: real documents, questions and reports can be private
 eval/data/
 eval/reports/
+
+# uploaded documents (the app's own copies): never commit
+storage/
