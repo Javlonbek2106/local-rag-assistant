@@ -10,13 +10,21 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from rag import answer, config, db, ingest, llm, storage, store
+from rag import answer, config, db, ingest, llm, storage, store, versioning
 
 log = logging.getLogger(__name__)
 
 
 class Question(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
+
+
+class Rollback(BaseModel):
+    version: int = Field(ge=1)
+
+
+def iso(moment):
+    return moment.isoformat() if moment else None
 
 
 def create_app(repo=db):
@@ -32,6 +40,7 @@ def create_app(repo=db):
             leftover.unlink(missing_ok=True)
         try:
             store.ensure_collection(store.get_client(), lambda: len(llm.embed(["probe"])[0]))
+            versioning.backfill_legacy(repo, store.get_client())
         except Exception:  # noqa: BLE001 - Qdrant/Ollama may start later; asking will then report it clearly
             log.exception("could not prepare the index at startup")
         yield
@@ -62,6 +71,9 @@ def create_app(repo=db):
         rows = [
             {"name": d["name"], "size": d["size_bytes"], "chunks": d["chunks"], "error": d["error"],
              "seconds": d["seconds"],
+             # the version searches use now (None until the first one is ready), the newest uploaded one, and why
+             # the newest failed while an older one keeps working
+             "version": d["version"], "latest_version": d["latest_version"], "update_error": d["update_error"],
              # The page does not distinguish "still uploading" from "waiting for a worker".
              "state": "queued" if d["state"] == "uploading" else d["state"]}
             for d in repo.list_documents()
@@ -91,15 +103,11 @@ def create_app(repo=db):
                 error = f"Fayl {config.MAX_UPLOAD_BYTES // 1024 // 1024} MB dan katta" if too_big else "Fayl bo'sh"
                 results.append({"name": name, "accepted": False, "error": error})
                 continue
-            try:
-                ingest.queue_file(name, temp, size, repo)
-            except db.Busy:
-                temp.unlink(missing_ok=True)
-                busy = "Fayl hozir o'qilmoqda, tugagach qayta yuklang"
-                results.append({"name": name, "accepted": False, "error": busy})
-                continue
-            log.info("uploaded %s (%d bytes)", name, size)
-            results.append({"name": name, "accepted": True})
+            version = ingest.queue_file(name, temp, size, repo)
+            if version["created"]:
+                log.info("uploaded %s as version %d (%d bytes)", name, version["version_number"], size)
+            results.append({"name": name, "accepted": True, "version": version["version_number"],
+                            "unchanged": not version["created"]})
         return {"results": results}
 
     @app.delete("/api/documents/{name}")
@@ -115,10 +123,33 @@ def create_app(repo=db):
             log.info("deleted %s", name)
         return {"deleted": name}
 
+    @app.get("/api/documents/{name}/versions")
+    def versions(name: str):
+        found = repo.list_versions(valid_name(name))
+        if found is None:
+            raise HTTPException(404, "Hujjat topilmadi")
+        return {"name": name, "versions": [
+            {"version": v["version_number"], "status": v["status"], "active": bool(v["active"]),
+             "size": v["file_size"], "chunks": v["chunk_count"], "error": v["error_message"],
+             "created_at": iso(v["created_at"]), "indexed_at": iso(v["indexed_at"]),
+             "activated_at": iso(v["activated_at"])}
+            for v in found]}
+
+    @app.post("/api/documents/{name}/rollback")
+    def rollback(name: str, body: Rollback):
+        try:
+            restored = versioning.rollback(repo, store.get_client(), valid_name(name), body.version)
+        except versioning.RollbackError as error:
+            raise HTTPException(error.status, str(error)) from error
+        except Exception as error:
+            log.exception("rollback failed")
+            raise HTTPException(503, f"Qaytarib bo'lmadi (Qdrant yoqilganmi?): {error}") from error
+        return {"name": name, "version": restored["version_number"], "active": True}
+
     @app.post("/api/ask")
     def ask(body: Question):
         try:
-            hits = answer.retrieve(body.question)
+            hits = answer.retrieve(body.question, repo=repo)
         except Exception as error:
             log.exception("retrieval failed")
             raise HTTPException(503, f"Qidiruv ishlamadi (Ollama va Qdrant yoqilganmi?): {error}") from error

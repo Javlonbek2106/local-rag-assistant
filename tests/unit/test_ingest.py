@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rag import config, db, ingest, llm, store, worker
+from rag import config, ingest, llm, storage, store, worker
 
 
 def chunk(pages, headings=("H",)):
@@ -71,22 +71,34 @@ def test_purge_orphans_refuses_to_wipe_the_index_when_no_document_is_known(monke
 def test_queue_file_registers_stores_and_enqueues_in_that_order(tmp_path, storage_dir, repo):
     temp = tmp_path / "upload.tmp"
     temp.write_bytes(b"matn")
-    doc_id = ingest.queue_file("a.txt", temp, 4, repo)
-    assert repo.docs["a.txt"]["id"] == doc_id and repo.docs["a.txt"]["state"] == "queued"
-    assert (storage_dir / str(doc_id) / "a.txt").read_bytes() == b"matn"
+    version = ingest.queue_file("a.txt", temp, 4, repo)
+    assert version["created"] and version["version_number"] == 1
+    assert repo.docs["a.txt"]["id"] == version["document_id"] and repo.docs["a.txt"]["state"] == "queued"
+    assert storage.resolve(version["file_path"]).read_bytes() == b"matn"
+    assert version["file_path"] == f"documents/{version['document_id']}/versions/{version['id']}/original.txt"
     assert not temp.exists()
 
 
-def test_queue_file_refuses_a_document_that_is_being_indexed(tmp_path, storage_dir, repo):
-    ingest.queue_file("a.txt", _temp(tmp_path, "one"), 3, repo)
-    repo.docs["a.txt"]["state"] = "processing"
-    with pytest.raises(db.Busy):
-        ingest.queue_file("a.txt", _temp(tmp_path, "two"), 3, repo)
+def test_queue_file_adds_the_next_version_even_while_the_first_is_being_indexed(tmp_path, storage_dir, repo):
+    first = ingest.queue_file("a.txt", _temp(tmp_path, "one", b"one"), 3, repo)
+    repo.set_status("a.txt", 1, "PROCESSING")
+    second = ingest.queue_file("a.txt", _temp(tmp_path, "two", b"two"), 3, repo)
+    assert second["version_number"] == 2 and second["document_id"] == first["document_id"]
+    assert storage.resolve(first["file_path"]).read_bytes() == b"one"  # the file being indexed is never replaced
+    assert storage.resolve(second["file_path"]).read_bytes() == b"two"
 
 
-def _temp(tmp_path, name):
+def test_queue_file_does_not_queue_an_unchanged_file_again(tmp_path, storage_dir, repo):
+    ingest.queue_file("a.txt", _temp(tmp_path, "one", b"same"), 4, repo)
+    again_temp = _temp(tmp_path, "two", b"same")
+    again = ingest.queue_file("a.txt", again_temp, 4, repo)
+    assert not again["created"] and len(repo.versions) == 1
+    assert not again_temp.exists()  # the duplicate upload is discarded
+
+
+def _temp(tmp_path, name, content=b"x"):
     path = tmp_path / name
-    path.write_bytes(b"x")
+    path.write_bytes(content)
     return path
 
 

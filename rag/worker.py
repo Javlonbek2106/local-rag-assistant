@@ -7,6 +7,7 @@ While a document is processed a guard thread sends heartbeats and enforces the t
 be killed from inside a Python process, so on timeout the worker exits with EXIT_RESTART and the supervisor starts
 a fresh one. If the whole process dies, its documents are put back in the queue by whichever worker is alive.
 """
+import hashlib
 import logging
 import os
 import socket
@@ -16,10 +17,14 @@ import threading
 import time
 import uuid
 
-from rag import config, db, ingest, llm, storage, store
+from rag import config, db, ingest, llm, storage, store, versioning
 
 log = logging.getLogger(__name__)
 EXIT_RESTART = 75
+
+
+class ClaimLost(Exception):
+    """This worker was declared dead and replaced while it was working; it must stop and write nothing."""
 
 
 def purge_orphans(client, known_ids):
@@ -86,6 +91,7 @@ class Worker:
         self.repo.migrate()
         self.client = store.get_client()
         store.ensure_collection(self.client, lambda: len(llm.embed(["probe"])[0]))
+        versioning.backfill_legacy(self.repo, self.client)
         self.converter, self.chunker = ingest.build_pipeline()
         purge_orphans(self.client, {str(d["id"]) for d in self.repo.list_documents()})
         log.info("worker %s ready", self.worker_id)
@@ -107,33 +113,60 @@ class Worker:
         self.process(job)
         return True
 
+    def index(self, job):
+        """Parse, embed, index and verify one version; return its chunk count. Nothing here makes it active."""
+        path = storage.resolve(job["file_path"])
+        if not path.exists():
+            raise FileNotFoundError(f"fayl topilmadi: {job['name']}")
+        with path.open("rb") as f:
+            actual_hash = hashlib.file_digest(f, "sha256").hexdigest()
+        file_hash = job["file_hash"]
+        if file_hash is None:  # a version registered by the migration that was queued again before the backfill
+            file_hash = actual_hash
+            self.repo.set_file_hash(job["id"], file_hash)
+        elif actual_hash != file_hash:  # the stored file is not the one that was uploaded: never index it as such
+            raise ValueError("Saqlangan fayl yuklangan fayldan farq qiladi (hash mos emas)")
+
+        def stage(status):
+            if not self.repo.set_stage(job["id"], self.worker_id, status):
+                raise ClaimLost(job["name"])
+
+        count = ingest.index_version(self.client, self.converter, self.chunker, path, document_id=job["document_id"],
+                                     version_id=job["id"], file_name=job["file_name"], file_hash=file_hash,
+                                     stage=stage)
+        stage("VERIFYING")
+        versioning.verify(self.client, job["document_id"], job["id"], file_hash, count)
+        if not self.repo.record_verified(job["id"], self.worker_id, count):
+            raise ClaimLost(job["name"])
+        return count
+
     def process(self, job):
         started = time.monotonic()
         with JobGuard(self.repo, job, self.worker_id, self.on_timeout) as guard:
             try:
-                path = storage.path_for(job["id"], job["name"])
-                if not path.exists():
-                    raise FileNotFoundError(f"fayl topilmadi: {job['name']}")
-                source = str(job["id"])
-                count = ingest.index_file(self.client, self.converter, self.chunker, path, source=source)
-                chunks = store.count_chunks(self.client, source) if count is None else count
-            except (ingest.UnreadableDocument, FileNotFoundError) as error:
+                count = self.index(job)
+            except ClaimLost:
+                log.warning("%s: claim lost, another worker has taken over; stopping", job["name"])
+                outcome = ("lost", None, None)
+            except (ingest.UnreadableDocument, FileNotFoundError, ValueError) as error:
                 log.warning("%s: %s", job["name"], error)
                 outcome = ("fail", str(error), False)
             except Exception as error:  # noqa: BLE001 - anything else may be temporary (Qdrant, Ollama): retry
                 log.exception("indexing %s failed (attempt %d)", job["name"], job["attempts"])
                 outcome = ("fail", str(error), True)
             else:
-                outcome = ("complete", chunks, None)
+                outcome = ("activate", count, None)
         if guard.timed_out:
             return  # already recorded by the guard, which is about to restart the process
         kind, value, retry = outcome
-        if kind == "complete":
-            if self.repo.complete(job["id"], self.worker_id, value):
-                log.info("%s: %d chunks in %.1fs", job["name"], value, time.monotonic() - started)
+        if kind == "activate":
+            result = self.repo.activate(job["id"], self.worker_id, value)
+            if result:
+                log.info("%s v%d: %d chunks in %.1fs, %s", job["name"], job["version_number"], value,
+                         time.monotonic() - started, result)
             else:
                 log.warning("%s finished, but another worker already owns it; result discarded", job["name"])
-        else:
+        elif kind == "fail":
             state = self.repo.fail(job["id"], self.worker_id, value, retry=retry)
             log.info("%s -> %s", job["name"], state)
 

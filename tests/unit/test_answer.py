@@ -10,16 +10,31 @@ class FakeSearchClient:
     def __init__(self, hits):
         self.hits = hits
         self.queries = []
+        self.filters = []
 
-    def query_points(self, collection, query, limit, with_payload):
+    def query_points(self, collection, query, limit, with_payload, query_filter=None):
         self.queries.append((collection, query, limit))
+        self.filters.append(query_filter)
         return SimpleNamespace(points=self.hits)
+
+
+class ActiveVersions:
+    """Stands in for the database: which document versions are active."""
+
+    def __init__(self, *ids):
+        self.ids = list(ids)
+
+    def active_version_ids(self):
+        return self.ids
+
+
+ACTIVE = ActiveVersions("v1")
 
 
 def test_retrieve_drops_chunks_below_the_score_threshold(monkeypatch):
     monkeypatch.setattr(llm, "embed", lambda texts: [[0.1, 0.2]])
     client = FakeSearchClient([make_hit(0.9), make_hit(0.5), make_hit(0.39)])
-    kept = answer.retrieve("savol", client)
+    kept = answer.retrieve("savol", client, ACTIVE)
     assert [h.score for h in kept] == [0.9, 0.5]
     assert client.queries == [(config.COLLECTION, [0.1, 0.2], config.TOP_K)]
 
@@ -32,14 +47,14 @@ def test_reranker_reorders_a_wider_candidate_list_and_keeps_top_k(monkeypatch):
     hits = [make_hit(0.9, text="a"), make_hit(0.8, text="b"), make_hit(0.7, text="c")]
     monkeypatch.setattr(rerank, "scores", lambda question, texts: [{"a": 0.1, "b": 0.2, "c": 0.9}[t] for t in texts])
     client = FakeSearchClient(hits)
-    kept = answer.retrieve("savol", client)
+    kept = answer.retrieve("savol", client, ACTIVE)
     assert [h.payload["text"] for h in kept] == ["c", "b"]  # best by the cross-encoder, cut to TOP_K
     assert client.queries[0][2] == 8  # asked the index for the wider candidate list
 
 
 def test_retrieve_handles_an_empty_index(monkeypatch):
     monkeypatch.setattr(llm, "embed", lambda texts: [[0.0]])
-    assert answer.retrieve("savol", FakeSearchClient([])) == []
+    assert answer.retrieve("savol", FakeSearchClient([]), ACTIVE) == []
 
 
 def test_no_chunks_means_not_found_without_calling_the_model(monkeypatch):
@@ -93,5 +108,41 @@ def test_without_any_valid_citation_every_retrieved_source_is_shown():
 def test_threshold_is_configurable(monkeypatch, value):
     monkeypatch.setattr(config, "MIN_SCORE", value)
     monkeypatch.setattr(llm, "embed", lambda texts: [[0.0]])
-    kept = answer.retrieve("q", FakeSearchClient([make_hit(0.5)]))
+    kept = answer.retrieve("q", FakeSearchClient([make_hit(0.5)]), ACTIVE)
     assert len(kept) == (1 if value == 0.0 else 0)
+
+
+def test_search_only_looks_at_the_active_versions(monkeypatch):
+    monkeypatch.setattr(llm, "embed", lambda texts: [[0.1]])
+    client = FakeSearchClient([make_hit()])
+    answer.retrieve("savol", client, ActiveVersions("v1", "v7"))
+    condition = client.filters[0].must[0]
+    assert condition.key == "version_id" and sorted(condition.match.any) == ["v1", "v7"]
+
+
+def test_with_no_active_version_nothing_is_found_and_the_index_is_not_even_asked(monkeypatch):
+    # an empty filter would mean "everything": it must mean "nothing"
+    monkeypatch.setattr(llm, "embed", lambda texts: pytest.fail("no need to embed the question"))
+    client = FakeSearchClient([make_hit()])
+    assert answer.retrieve("savol", client, ActiveVersions()) == []
+    assert client.queries == []
+
+
+def test_the_active_versions_are_read_once_per_question(monkeypatch):
+    monkeypatch.setattr(llm, "embed", lambda texts: [[0.1]])
+    calls = []
+
+    class Counting(ActiveVersions):
+        def active_version_ids(self):
+            calls.append(1)
+            return super().active_version_ids()
+
+    answer.retrieve("savol", FakeSearchClient([make_hit()]), Counting("v1"))
+    assert len(calls) == 1
+
+
+def test_evaluation_indexes_without_versions_are_searched_unfiltered(monkeypatch):
+    monkeypatch.setattr(llm, "embed", lambda texts: [[0.1]])
+    client = FakeSearchClient([make_hit()])
+    answer.search("savol", client, 3, answer.UNVERSIONED)
+    assert client.filters == [None]

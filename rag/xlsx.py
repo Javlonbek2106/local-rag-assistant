@@ -30,9 +30,9 @@ def _filled(row):
     return {i: v for i, v in enumerate(row) if v is not None and _text(v) != ""}
 
 
-def _is_header(row):
+def _is_header(row, at_least=3):
     cells = _filled(row)
-    return len(cells) >= 3 and all(isinstance(v, str) for v in cells.values())
+    return len(cells) >= at_least and all(isinstance(v, str) for v in cells.values())
 
 
 def _is_numbering(row):
@@ -52,7 +52,10 @@ def _is_annotation(row):
 
 def _sheet_chunks(name, rows):
     """Yield the text of each data row of one sheet. `rows` are the cell values of the rows, top to bottom."""
+    # A wide table's header has 3+ text cells; a narrow one (name | value) has 2. A sheet with neither is not a table.
     header_at = next((i for i, row in enumerate(rows) if _is_header(row)), None)
+    if header_at is None:
+        header_at = next((i for i, row in enumerate(rows) if _is_header(row, at_least=2)), None)
     if header_at is None:
         return
     title = " ".join(_text(v) for row in rows[:header_at] for v in _filled(row).values())[:TITLE_LIMIT]
