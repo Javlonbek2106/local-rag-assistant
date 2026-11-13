@@ -255,6 +255,25 @@ def test_a_failed_new_version_leaves_the_old_one_active_and_untouched(tmp_path, 
     assert "qdrant is down" in found["update_error"] and found["error"] is None
 
 
+def test_a_stored_file_that_is_not_the_uploaded_one_is_never_indexed(tmp_path, indexed):
+    queued = queue(tmp_path, content=b"asl matn")
+    storage.resolve(queued["file_path"]).write_bytes(b"boshqa matn")  # changed on disk after the upload
+    make_worker().run_once()
+    assert indexed == []  # nothing was parsed
+    assert row("a.txt")["state"] == "failed" and "hash" in row("a.txt")["error"]
+    assert version("a.txt")["attempts"] == 1  # retrying cannot help, so it is not retried
+
+
+def test_the_verified_chunk_count_is_recorded_before_activation(tmp_path, monkeypatch, verified):
+    monkeypatch.setattr(ingest, "index_version", lambda *args, **kwargs: 6)
+    seen = []
+    monkeypatch.setattr(versioning, "verify", lambda *args: seen.append(version("a.txt")["chunk_count"]))
+    queue(tmp_path)
+    make_worker().run_once()
+    assert seen == [None]  # still unverified while the check runs
+    assert version("a.txt")["chunk_count"] == 6 and version("a.txt")["status"] == "READY"
+
+
 def test_an_incomplete_index_is_never_activated(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "JOB_MAX_ATTEMPTS", 1)
     monkeypatch.setattr(ingest, "index_version", lambda *args, **kwargs: 5)

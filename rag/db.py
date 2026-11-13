@@ -255,7 +255,7 @@ def claim_next(worker_id):
             f"""
             WITH claimed AS (
                 UPDATE document_versions SET status = 'PROCESSING', claimed_by = %s, attempts = attempts + 1,
-                       started_at = now(), heartbeat_at = now(), updated_at = now()
+                       chunk_count = NULL, started_at = now(), heartbeat_at = now(), updated_at = now()
                 WHERE id = (SELECT c.id FROM document_versions c
                             WHERE c.status = 'QUEUED'
                               AND NOT EXISTS (SELECT 1 FROM document_versions o
@@ -295,19 +295,33 @@ def set_stage(version_id, worker_id, status):
         ).fetchone() is not None
 
 
+def record_verified(version_id, worker_id, chunk_count):
+    """Record that the version's index was checked and found complete (rag.versioning.verify passed): the chunk count
+    is written only now, and activate() accepts nothing without it. False if the claim was lost."""
+    with pool().connection() as conn:
+        return conn.execute(
+            "UPDATE document_versions SET chunk_count = %s, updated_at = now() "
+            "WHERE id = %s AND claimed_by = %s AND status = 'VERIFYING' RETURNING id",
+            (chunk_count, version_id, worker_id),
+        ).fetchone() is not None
+
+
 def activate(version_id, worker_id, chunk_count):
     """Make a verified version the active one, in one transaction. Returns "activated", "superseded" (a newer
-    version is already active, so this one is only kept for rollback) or None (the claim was lost, nothing changed).
+    version is already active, so this one is only kept for rollback) or None (the claim was lost or the version was
+    not verified; nothing changed).
 
-    Steps: lock this version, then its document, then the active version; confirm this worker still holds the claim
-    and the version is VERIFYING; demote the old active version; promote this one; refresh the document summary.
+    Steps: lock this version, then its document, then the active version; confirm this worker still holds the claim,
+    the version is VERIFYING and its verified chunk count was recorded (record_verified) and matches; demote the old
+    active version; promote this one; refresh the document summary.
     """
     with pool().connection() as conn, conn.transaction():
         mine = conn.execute(
-            "SELECT id, document_id, version_number, status, claimed_by FROM document_versions WHERE id = %s "
-            "FOR UPDATE", (version_id,),
+            "SELECT id, document_id, version_number, status, claimed_by, chunk_count FROM document_versions "
+            "WHERE id = %s FOR UPDATE", (version_id,),
         ).fetchone()
-        if mine is None or mine["claimed_by"] != worker_id or mine["status"] != "VERIFYING":
+        if (mine is None or mine["claimed_by"] != worker_id or mine["status"] != "VERIFYING"
+                or mine["chunk_count"] != chunk_count):  # chunk_count is NULL until record_verified
             return None
         doc = conn.execute("SELECT active_version_id FROM documents WHERE id = %s FOR UPDATE",
                            (mine["document_id"],)).fetchone()

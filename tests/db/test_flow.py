@@ -32,6 +32,7 @@ def activate(name, number, chunks=1, worker="w1"):
     job = db.claim_next(worker)
     assert job["name"] == name and job["version_number"] == number
     assert db.set_stage(job["id"], worker, "VERIFYING")
+    assert db.record_verified(job["id"], worker, chunks)
     assert db.activate(job["id"], worker, chunks) == "activated"
     return job
 
@@ -142,8 +143,8 @@ def test_a_question_is_answered_only_from_the_active_version(client, monkeypatch
     monkeypatch.setattr(llm, "embed", lambda texts: [[0.1]])
     monkeypatch.setattr(config, "MIN_SCORE", 0.0)
     assert [h.payload["text"] for h in answer.retrieve("narx?", client.qdrant)] == ["Narx: 100 so'm"]
-    activate_second = (db.set_stage(second["id"], "w1", "VERIFYING"), db.activate(second["id"], "w1", 2))
-    assert activate_second[1] == "activated"
+    assert db.set_stage(second["id"], "w1", "VERIFYING") and db.record_verified(second["id"], "w1", 2)
+    assert db.activate(second["id"], "w1", 2) == "activated"
     assert sorted(h.payload["text"] for h in answer.retrieve("narx?", client.qdrant)) == ["Narx: 999 so'm",
                                                                                           "Yangi bo'lim"]
 

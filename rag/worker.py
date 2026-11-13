@@ -118,11 +118,14 @@ class Worker:
         path = storage.resolve(job["file_path"])
         if not path.exists():
             raise FileNotFoundError(f"fayl topilmadi: {job['name']}")
+        with path.open("rb") as f:
+            actual_hash = hashlib.file_digest(f, "sha256").hexdigest()
         file_hash = job["file_hash"]
         if file_hash is None:  # a version registered by the migration that was queued again before the backfill
-            with path.open("rb") as f:
-                file_hash = hashlib.file_digest(f, "sha256").hexdigest()
+            file_hash = actual_hash
             self.repo.set_file_hash(job["id"], file_hash)
+        elif actual_hash != file_hash:  # the stored file is not the one that was uploaded: never index it as such
+            raise ValueError("Saqlangan fayl yuklangan fayldan farq qiladi (hash mos emas)")
 
         def stage(status):
             if not self.repo.set_stage(job["id"], self.worker_id, status):
@@ -133,6 +136,8 @@ class Worker:
                                      stage=stage)
         stage("VERIFYING")
         versioning.verify(self.client, job["document_id"], job["id"], file_hash, count)
+        if not self.repo.record_verified(job["id"], self.worker_id, count):
+            raise ClaimLost(job["name"])
         return count
 
     def process(self, job):

@@ -25,8 +25,9 @@ def version(name, number=1):
 
 
 def finish(job, worker, chunks):
-    """What a worker does after indexing: verify, then activate. Returns activate()'s answer."""
+    """What a worker does after indexing: verify (and record that), then activate. Returns activate()'s answer."""
     assert db.set_stage(job["id"], worker, "VERIFYING")
+    assert db.record_verified(job["id"], worker, chunks)
     return db.activate(job["id"], worker, chunks)
 
 
@@ -188,6 +189,7 @@ def test_only_the_claiming_worker_can_finish_a_document():
     make("a.pdf")
     job = db.claim_next("w1")
     assert not db.set_stage(job["id"], "someone-else", "VERIFYING")
+    assert not db.record_verified(job["id"], "someone-else", 3)
     assert db.activate(job["id"], "someone-else", chunk_count=3) is None
     assert db.fail(job["id"], "someone-else", "boom") is None
     assert not db.heartbeat(job["id"], "someone-else")
@@ -243,5 +245,6 @@ def test_a_replaced_worker_cannot_overwrite_the_new_result():
     new = db.claim_next("new-worker")
     assert finish(new, "new-worker", chunks=7) == "activated"
     assert not db.set_stage(old["id"], "old-worker", "VERIFYING")  # the zombie wakes up late
+    assert not db.record_verified(old["id"], "old-worker", 1)
     assert db.activate(old["id"], "old-worker", chunk_count=1) is None
     assert row("a.pdf")["chunks"] == 7

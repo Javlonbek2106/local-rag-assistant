@@ -72,10 +72,17 @@ bo'lsa, `ClaimLost` bilan to'xtaydi). Keyin `versioning.verify`:
 Yetishmagan, ortiqcha, boshqa hujjat yoki boshqa fayl ma'lumoti bo'lsa, `IndexIncomplete`: versiya faollashmaydi,
 ish siyosatga ko'ra qayta uriniladi yoki `FAILED` bo'ladi.
 
+Indekslashdan oldin worker diskdagi faylning SHA-256 ini DB dagi `file_hash` bilan solishtiradi; mos kelmasa
+(fayl yuklangandan keyin o'zgargan) versiya hech qachon indekslanmaydi va qayta urinilmaydi.
+
+Tekshiruv natijasi DB da saqlanadi: `verify` o'tgach worker `db.record_verified` bilan `chunk_count` ni yozadi
+(har yangi da'voda u `NULL` ga qaytariladi). `VERIFYING` faqat bosqich nomi; faollashtirish tekshiruv yozilmasa yoki
+son mos kelmasa rad etiladi.
+
 ## 6. Atomik faollashtirish (`db.activate`)
 
 Bitta tranzaksiyada: versiyani qulflash → hujjatni qulflash → joriy faol versiyani qulflash; versiya shu worker
-da'vosida va `VERIFYING` ekanini tekshirish; eskisini `SUPERSEDED`, yangisini `READY` qilish; `active_version_id`
+da'vosida, `VERIFYING` da va tekshirilgan `chunk_count` yozilgan hamda mos ekanini tekshirish; eskisini `SUPERSEDED`, yangisini `READY` qilish; `active_version_id`
 ni almashtirish; hujjat xulosasini yangilash; ishni (da'voni) bo'shatish. Biror qadam yiqilsa, hammasi qaytadi.
 Almashtirilgan (o'lik deb hisoblangan) worker `claimed_by` mos kelmagani uchun hech narsa yoza olmaydi.
 

@@ -22,6 +22,7 @@ def upload(name="a.pdf", content=None, size=10):
 
 def activate(job, worker="w1", chunks=3):
     assert db.set_stage(job["id"], worker, "VERIFYING")
+    assert db.record_verified(job["id"], worker, chunks)
     return db.activate(job["id"], worker, chunks)
 
 
@@ -114,8 +115,27 @@ def test_only_a_verified_version_can_be_activated():
     upload()
     job = db.claim_next("w1")
     assert db.activate(job["id"], "w1", 3) is None  # still PROCESSING: nothing was verified
+    assert db.set_stage(job["id"], "w1", "VERIFYING")
+    assert db.activate(job["id"], "w1", 3) is None  # VERIFYING is only the stage: no verification was recorded
+    assert db.record_verified(job["id"], "w1", 3)
+    assert db.activate(job["id"], "w1", 4) is None  # a different count than the verified one is refused too
     assert db.active_version_ids() == []
-    assert db.set_stage(job["id"], "w1", "VERIFYING") and db.activate(job["id"], "w1", 3) == "activated"
+    assert db.activate(job["id"], "w1", 3) == "activated"
+
+
+def test_a_new_claim_voids_earlier_verification_evidence():
+    upload()
+    job = db.claim_next("w1")
+    db.set_stage(job["id"], "w1", "VERIFYING")
+    db.record_verified(job["id"], "w1", 3)
+    age = "UPDATE document_versions SET heartbeat_at = now() - interval '10 minutes' WHERE id = %s"
+    with db.pool().connection() as conn:
+        conn.execute(age, (job["id"],))
+    assert db.requeue_stale(90) == 1
+    again = db.claim_next("w2")
+    assert again["chunk_count"] is None  # the next attempt has to verify for itself
+    db.set_stage(again["id"], "w2", "VERIFYING")
+    assert db.activate(again["id"], "w2", 3) is None
 
 
 def test_activation_replaces_the_previous_version_in_one_step():
@@ -136,10 +156,10 @@ def test_an_older_version_finishing_late_never_replaces_a_newer_active_one():
     v3 = upload(content="three")
     # v2 and v3 were processed in parallel after v1's worker died; v3 finishes first
     with db.pool().connection() as conn:
-        conn.execute("UPDATE document_versions SET status = 'VERIFYING', claimed_by = 'w3' WHERE id = %s",
-                     (v3["id"],))
-        conn.execute("UPDATE document_versions SET status = 'VERIFYING', claimed_by = 'w2' WHERE id = %s",
-                     (v2["id"],))
+        conn.execute("UPDATE document_versions SET status = 'VERIFYING', claimed_by = 'w3', chunk_count = 3 "
+                     "WHERE id = %s", (v3["id"],))
+        conn.execute("UPDATE document_versions SET status = 'VERIFYING', claimed_by = 'w2', chunk_count = 2 "
+                     "WHERE id = %s", (v2["id"],))
         conn.execute("UPDATE document_versions SET status = 'FAILED' WHERE id = %s", (v1["id"],))
     assert db.activate(v3["id"], "w3", 3) == "activated"
     assert db.activate(v2["id"], "w2", 2) == "superseded"  # too late: kept for rollback, not made active
