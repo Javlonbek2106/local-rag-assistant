@@ -27,7 +27,7 @@ MIGRATION_LOCK = 727001  # arbitrary key for pg_advisory_lock: api and worker ma
 INFLIGHT = ("PROCESSING", "EMBEDDING", "INDEXING", "VERIFYING")  # a worker holds the version
 _INFLIGHT = "('PROCESSING', 'EMBEDDING', 'INDEXING', 'VERIFYING')"
 DOCUMENT_SELECT = f"""
-    SELECT d.id, d.name, d.size_bytes, d.state, d.chunks,
+    SELECT d.id, d.name, d.size_bytes, d.state, d.chunks, d.activation_generation,
            CASE WHEN d.state = 'failed' THEN d.error END AS error,
            CASE WHEN d.state = 'done' THEN d.error END AS update_error,
            d.created_at, d.updated_at, av.version_number AS version,
@@ -39,6 +39,7 @@ DOCUMENT_SELECT = f"""
 VERSION_COLUMNS = f"""
     v.id, v.document_id, d.name, v.version_number, v.file_name, v.file_hash, v.file_size, v.file_path, v.status,
     v.chunk_count, v.error_message, v.attempts, v.claimed_by, v.created_at, v.indexed_at, v.activated_at,
+    v.uploaded_generation, d.activation_generation,
     (d.active_version_id = v.id) AS active,
     CASE WHEN v.status IN {_INFLIGHT} THEN extract(epoch FROM now() - v.started_at)::int END AS seconds
 """
@@ -119,13 +120,15 @@ def create_version(name, size_bytes, file_hash):
 
     Returns {"id", "document_id", "version_number", "file_path", "created"}. The version starts as UPLOADED: the caller
     saves the file at `file_path` (rag.storage) and then calls enqueue(). Uploads of the same name are serialised by
-    the document row, so version numbers never collide. A file identical to the newest version that did not fail
-    creates nothing (created=False) and returns that version.
+    the document row, so version numbers never collide, and the upload is stamped with the document's rollback count
+    (uploaded_generation): a rollback committed after this point makes it a stale candidate. A file identical to the
+    newest version that did not fail creates nothing (created=False) and returns that version.
     """
     with pool().connection() as conn, conn.transaction():
         doc = conn.execute(
             "INSERT INTO documents (name, size_bytes, state) VALUES (%s, %s, 'uploading') "
-            "ON CONFLICT (name) DO UPDATE SET updated_at = now() RETURNING id",  # the update also locks the row
+            "ON CONFLICT (name) DO UPDATE SET updated_at = now() "
+            "RETURNING id, activation_generation",  # the update also locks the row
             (name, size_bytes),
         ).fetchone()
         newest = conn.execute(
@@ -143,8 +146,8 @@ def create_version(name, size_bytes, file_hash):
         path = storage.relative_path(doc["id"], version_id, name)
         conn.execute(
             "INSERT INTO document_versions (id, document_id, version_number, file_name, file_hash, file_size, "
-            "file_path, status) VALUES (%s, %s, %s, %s, %s, %s, %s, 'UPLOADED')",
-            (version_id, doc["id"], number, name, file_hash, size_bytes, path),
+            "file_path, status, uploaded_generation) VALUES (%s, %s, %s, %s, %s, %s, %s, 'UPLOADED', %s)",
+            (version_id, doc["id"], number, name, file_hash, size_bytes, path, doc["activation_generation"]),
         )
         _sync_document(conn, doc["id"])
     return {"id": version_id, "document_id": doc["id"], "version_number": number, "file_path": path,
@@ -307,30 +310,38 @@ def record_verified(version_id, worker_id, chunk_count):
 
 
 def activate(version_id, worker_id, chunk_count):
-    """Make a verified version the active one, in one transaction. Returns "activated", "superseded" (a newer
-    version is already active, so this one is only kept for rollback) or None (the claim was lost or the version was
-    not verified; nothing changed).
+    """Make a verified version the active one, in one transaction. Returns "activated", "superseded" (the version is
+    only kept, for a later rollback or roll-forward) or None (the claim was lost or the version was not verified;
+    nothing changed).
 
     Steps: lock this version, then its document, then the active version; confirm this worker still holds the claim,
-    the version is VERIFYING and its verified chunk count was recorded (record_verified) and matches; demote the old
-    active version; promote this one; refresh the document summary.
+    the version is VERIFYING and its verified chunk count was recorded (record_verified) and matches; then decide:
+
+    - a rollback happened after this version was uploaded (uploaded_generation < the document's activation_generation):
+      the user chose a version since, and this late candidate must not replace that choice -> "superseded";
+    - a newer version is already active -> "superseded";
+    - otherwise demote the old active version, promote this one and refresh the document summary -> "activated".
+
+    The generation is compared under the document lock, which a rollback also takes, so a rollback either commits
+    before this check (and wins) or after this activation (and then overrides it, as the later decision).
     """
     with pool().connection() as conn, conn.transaction():
         mine = conn.execute(
-            "SELECT id, document_id, version_number, status, claimed_by, chunk_count FROM document_versions "
-            "WHERE id = %s FOR UPDATE", (version_id,),
+            "SELECT id, document_id, version_number, status, claimed_by, chunk_count, uploaded_generation "
+            "FROM document_versions WHERE id = %s FOR UPDATE", (version_id,),
         ).fetchone()
         if (mine is None or mine["claimed_by"] != worker_id or mine["status"] != "VERIFYING"
                 or mine["chunk_count"] != chunk_count):  # chunk_count is NULL until record_verified
             return None
-        doc = conn.execute("SELECT active_version_id FROM documents WHERE id = %s FOR UPDATE",
+        doc = conn.execute("SELECT active_version_id, activation_generation FROM documents WHERE id = %s FOR UPDATE",
                            (mine["document_id"],)).fetchone()
         current = None
         if doc["active_version_id"]:
             current = conn.execute("SELECT id, version_number FROM document_versions WHERE id = %s FOR UPDATE",
                                    (doc["active_version_id"],)).fetchone()
+        rolled_back_since = mine["uploaded_generation"] < doc["activation_generation"]
         released = "claimed_by = NULL, heartbeat_at = NULL, started_at = NULL, error_message = NULL, updated_at = now()"
-        if current and current["version_number"] > mine["version_number"]:
+        if rolled_back_since or (current and current["version_number"] > mine["version_number"]):
             conn.execute(f"UPDATE document_versions SET status = 'SUPERSEDED', chunk_count = %s, indexed_at = now(), "
                          f"{released} WHERE id = %s", (chunk_count, version_id))
             outcome = "superseded"
@@ -347,8 +358,15 @@ def activate(version_id, worker_id, chunk_count):
 
 
 def switch_active(version_id):
-    """Roll back to an earlier version that was active once (status SUPERSEDED). Raises VersionConflict otherwise.
-    The caller has already checked that its vectors are complete."""
+    """Roll back to a version that was active once (status SUPERSEDED). Raises VersionConflict otherwise, changing
+    nothing. The caller has already checked that its vectors are complete.
+
+    In one transaction (locks: the version, the document, the version being replaced): re-check the status, demote the
+    active version, promote this one and add one to the document's activation_generation. That increment is what makes
+    the rollback a durable decision: every version uploaded before it and still unfinished is now a stale candidate that
+    activate() will only keep, never make active. Versions uploaded afterwards are stamped with the new generation.
+    Returns the new activation generation.
+    """
     with pool().connection() as conn, conn.transaction():
         mine = conn.execute(
             "SELECT id, document_id, status, chunk_count FROM document_versions WHERE id = %s FOR UPDATE",
@@ -366,8 +384,12 @@ def switch_active(version_id):
                          (doc["active_version_id"],))
         conn.execute("UPDATE document_versions SET status = 'READY', activated_at = now(), updated_at = now() "
                      "WHERE id = %s", (version_id,))
-        conn.execute("UPDATE documents SET active_version_id = %s WHERE id = %s", (version_id, mine["document_id"]))
+        generation = conn.execute(
+            "UPDATE documents SET active_version_id = %s, activation_generation = activation_generation + 1 "
+            "WHERE id = %s RETURNING activation_generation", (version_id, mine["document_id"]),
+        ).fetchone()["activation_generation"]
         _sync_document(conn, mine["document_id"])
+    return generation
 
 
 def fail(version_id, worker_id, error, retry=True):

@@ -44,7 +44,7 @@ def test_migrations_are_applied_once(database):
     db.migrate()
     with db.pool().connection() as conn:
         versions = [r["version"] for r in conn.execute("SELECT version FROM schema_migrations")]
-    assert versions == ["0001_documents", "0002_document_versions"]
+    assert versions == ["0001_documents", "0002_document_versions", "0003_rollback_generation"]
 
 
 def test_concurrent_first_start_of_api_and_worker_migrates_exactly_once(monkeypatch):
@@ -69,7 +69,7 @@ def test_concurrent_first_start_of_api_and_worker_migrates_exactly_once(monkeypa
             t.join()
         with db.pool().connection() as conn:
             count = conn.execute("SELECT count(*) AS n FROM schema_migrations").fetchone()["n"]
-        assert errors == [] and count == 2  # each migration exactly once
+        assert errors == [] and count == 3  # each migration exactly once
     finally:
         db.close()
         with psycopg.connect(config.DATABASE_URL, autocommit=True) as conn:

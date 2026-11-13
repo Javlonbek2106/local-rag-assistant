@@ -41,6 +41,10 @@ def rollback(repo, client, name, version_number):
 
     Refuses, changing nothing, when the version does not exist, is the active one, was never active (queued, failed,
     still being indexed), or its vectors are missing or incomplete. Returns the version that is now active.
+
+    A successful rollback is a durable decision (see db.switch_active): versions that were queued or being indexed
+    before it will not replace the chosen version when they finish. A refused rollback changes nothing at all, so
+    those versions stay free to activate.
     """
     version = repo.get_version(name, version_number)
     if version is None:
@@ -54,10 +58,10 @@ def rollback(repo, client, name, version_number):
     except IndexIncomplete as error:
         raise RollbackError(f"Versiya indeksi to'liq emas, qaytib bo'lmaydi: {error}") from error
     try:
-        repo.switch_active(version["id"])  # checks the status again under the lock
+        generation = repo.switch_active(version["id"])  # checks the status again under the lock
     except db.VersionConflict as error:
         raise RollbackError(str(error)) from error
-    log.info("%s rolled back to version %d", name, version_number)
+    log.info("%s rolled back to version %d (activation generation %s)", name, version_number, generation)
     return repo.get_version(name, version_number)
 
 
