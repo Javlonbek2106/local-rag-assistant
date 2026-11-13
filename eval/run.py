@@ -58,7 +58,8 @@ def index_documents(client, docs):
 
 
 def evaluate_question(client, case, with_answer):
-    hits = answer.search(case["q"], client, DEEP_K)  # the production search, only deeper
+    # the production search, only deeper; evaluation indexes have no versions
+    hits = answer.search(case["q"], client, DEEP_K, answer.UNVERSIONED)
     files = [h.payload["file_name"] for h in hits]
     pages = [h.payload["pages"] for h in hits]
     texts = [h.payload["text"] for h in hits]

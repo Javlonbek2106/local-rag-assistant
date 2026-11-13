@@ -33,7 +33,8 @@ Copy-Item "C:\Program Files\Tesseract-OCR\tessdata\configs" tessdata\configs -Re
 `start.bat` ni oching: Qdrant va PostgreSQL ko'tariladi, veb-ilova va worker ishga tushadi, brauzer ochiladi
 (`python -m rag`). Faqat ilova: `python -m rag api`, faqat worker: `python -m rag worker`.
 
-Yuklangan fayllar `storage/<hujjat id>/<nom>` da, hujjatlar ro'yxati va indekslash navbati PostgreSQL'da turadi.
+Yuklangan fayllar `storage/documents/<hujjat id>/versions/<versiya id>/original.<kengaytma>` da, hujjatlar, versiyalar
+va indekslash navbati PostgreSQL'da turadi. Hujjatni qayta yuklash yangi **versiya** yaratadi (batafsil: [docs/versioning.md](docs/versioning.md)).
 Ilova qayta yoqilsa ham navbat va ro'yxat saqlanadi. Eski `documents/` papkasi va `documents` kolleksiyasi
 (1-versiya) endi o'qilmaydi, kerak bo'lmasa o'chirib tashlash mumkin.
 
@@ -58,8 +59,9 @@ Hammasi [rag/config.py](rag/config.py) da, `RAG_*` muhit o'zgaruvchilari bilan a
 rag/config.py   sozlamalar          rag/store.py    Qdrant bilan ishlash
 rag/ingest.py   o'qish, bo'laklash  rag/llm.py      Ollama (embedding, javob)
 rag/answer.py   qidiruv va javob    rag/worker.py   indekslovchi jarayon va nazoratchi
-rag/api.py      veb API             rag/db.py       PostgreSQL: hujjatlar va navbat
+rag/api.py      veb API             rag/db.py       PostgreSQL: hujjatlar, versiyalar, navbat
 rag/storage.py  fayllar diskda      rag/migrations  SQL migratsiyalar
+rag/versioning.py  indeksni tekshirish, rollback, eski hujjatlarni moslash
 static/         sahifa
 ```
 

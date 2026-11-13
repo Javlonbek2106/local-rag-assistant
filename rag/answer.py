@@ -2,7 +2,7 @@
 import logging
 import re
 
-from rag import config, llm, rerank, store
+from rag import config, db, llm, rerank, store
 
 log = logging.getLogger(__name__)
 CITATION = re.compile(r"\[(\d+)\]")
@@ -37,14 +37,26 @@ def used_sources(answer_text, hits):
     return [(n, h) for n, h in numbered if n in cited] or numbered
 
 
-def search(question, client, limit):
-    """The `limit` best chunks, best first: vector search, re-ordered by the cross-encoder when one is set."""
+UNVERSIONED = object()  # evaluation indexes hold plain chunks without versions; production never passes this
+
+
+def search(question, client, limit, version_ids):
+    """The `limit` best chunks, best first: vector search, re-ordered by the cross-encoder when one is set.
+
+    `version_ids` are the active document versions (from PostgreSQL); only their chunks can be returned, and with
+    none active nothing is. Never pass a list that came from a client.
+    """
+    if version_ids is UNVERSIONED:
+        query_filter = None
+    elif not version_ids:
+        return []  # no active version means nothing may be found; an empty filter would mean "everything"
+    else:
+        query_filter = store.active_filter(version_ids)
     vector = llm.embed([question])[0]
-    if not config.RERANK_MODEL:
-        return client.query_points(config.COLLECTION, query=vector, limit=limit, with_payload=True).points
-    candidates = max(limit, config.RERANK_CANDIDATES)
-    hits = client.query_points(config.COLLECTION, query=vector, limit=candidates, with_payload=True).points
-    return rerank.rerank(question, hits)[:limit]
+    candidates = max(limit, config.RERANK_CANDIDATES) if config.RERANK_MODEL else limit
+    hits = client.query_points(config.COLLECTION, query=vector, limit=candidates, with_payload=True,
+                               query_filter=query_filter).points
+    return rerank.rerank(question, hits)[:limit] if config.RERANK_MODEL else hits
 
 
 def above_threshold(hits):
@@ -54,8 +66,9 @@ def above_threshold(hits):
     return kept
 
 
-def retrieve(question, client=None):
-    return above_threshold(search(question, client or store.get_client(), config.TOP_K))
+def retrieve(question, client=None, repo=db):
+    """The chunks to answer from. The active versions are read from PostgreSQL once per question."""
+    return above_threshold(search(question, client or store.get_client(), config.TOP_K, repo.active_version_ids()))
 
 
 def build_messages(question, hits):

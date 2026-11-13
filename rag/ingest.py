@@ -80,16 +80,21 @@ def convert(converter, path):
     return converter.convert(path).document
 
 
-def _make_points(items, source, file_name, file_hash):
-    """`items` is one (text, pages, headings) per chunk. Embeds the texts and builds the Qdrant points."""
-    from qdrant_client import models
-
+def _require_text(items):
     if not any(text.strip() for text, _, _ in items):
         raise UnreadableDocument("no text could be extracted")
-    vectors = llm.embed([text for text, _, _ in items])
+
+
+def _points(items, vectors, source, file_name, file_hash, document_id=None, version_id=None):
+    """Qdrant points for the chunks. A versioned chunk's id comes from its version and position, so writing the same
+    version again overwrites the same points instead of adding duplicates."""
+    from qdrant_client import models
+
+    extra = {"document_id": str(document_id), "version_id": str(version_id)} if version_id else {}
     return [
         models.PointStruct(
-            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{file_hash}:{index}")),
+            id=str(uuid.uuid5(uuid.NAMESPACE_URL,
+                              f"{version_id}:{index}" if version_id else f"{source}:{file_hash}:{index}")),
             vector=vector,
             payload={
                 "source": source,
@@ -100,21 +105,31 @@ def _make_points(items, source, file_name, file_hash):
                 "pages": pages,
                 "headings": headings,
                 "text": text,
+                **extra,
             },
         )
         for index, ((text, pages, headings), vector) in enumerate(zip(items, vectors, strict=True))
     ]
 
 
-def build_points(document, chunker, source, file_name, file_hash):
+def _make_points(items, source, file_name, file_hash):
+    """`items` is one (text, pages, headings) per chunk. Embeds the texts and builds the Qdrant points."""
+    _require_text(items)
+    return _points(items, llm.embed([text for text, _, _ in items]), source, file_name, file_hash)
+
+
+def document_items(document, chunker):
     chunks = list(chunker.chunk(document))
-    items = [
+    return [
         (chunker.contextualize(chunk),
          sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}),
          chunk.meta.headings or [])
         for chunk in chunks
     ]
-    return _make_points(items, source, file_name, file_hash)
+
+
+def build_points(document, chunker, source, file_name, file_hash):
+    return _make_points(document_items(document, chunker), source, file_name, file_hash)
 
 
 def xlsx_points(path, source, file_hash):
@@ -124,20 +139,43 @@ def xlsx_points(path, source, file_hash):
     return _make_points(xlsx.chunks(path), source, path.name, file_hash)
 
 
-def index_file(client, converter, chunker, path, source=None):
-    """Return the number of chunks written, or None if this exact file version is already stored.
+def extract_items(converter, chunker, path):
+    """Parse a file and cut it into (text, pages, headings) chunks."""
+    if path.suffix.lower() == ".xlsx":
+        from rag import xlsx
 
-    `source` identifies the document in the index (the web app passes the document id; it defaults to the path).
+        return xlsx.chunks(path)
+    return document_items(convert(converter, path), chunker)
+
+
+def index_version(client, converter, chunker, path, *, document_id, version_id, file_name, file_hash,
+                  stage=lambda status: None):
+    """Index one document version into its own set of Qdrant points and return the number of chunks written.
+
+    `stage` is told EMBEDDING and INDEXING as the work reaches them (the worker records them, and raises to stop if
+    its claim was lost). The version's chunks from an earlier attempt are removed first, so a retry never leaves
+    leftovers; no other version is touched. Verifying and activating are the caller's job.
     """
+    items = extract_items(converter, chunker, path)
+    _require_text(items)
+    stage("EMBEDDING")
+    vectors = llm.embed([text for text, _, _ in items])
+    points = _points(items, vectors, str(document_id), file_name, file_hash, document_id, version_id)
+    stage("INDEXING")
+    store.delete_version(client, version_id)
+    client.upload_points(config.COLLECTION, points=points, batch_size=64, wait=True)
+    return len(points)
+
+
+def index_file(client, converter, chunker, path, source=None):
+    """Evaluation and command-line use, without a database: return the number of chunks written, or None if this
+    exact file is already stored. `source` identifies the document in the index (defaults to the path)."""
     source = source or str(path)
     with path.open("rb") as f:
         file_hash = hashlib.file_digest(f, "sha256").hexdigest()
     if store.is_indexed(client, source, file_hash):
         return None
-    if path.suffix.lower() == ".xlsx":
-        points = xlsx_points(path, source, file_hash)
-    else:
-        points = build_points(convert(converter, path), chunker, source, path.name, file_hash)
+    points = _make_points(extract_items(converter, chunker, path), source, path.name, file_hash)
     # Old chunks go only after the new ones are embedded, so a parse or embed failure keeps them.
     store.delete_source(client, source)
     client.upload_points(config.COLLECTION, points=points, batch_size=64, wait=True)
@@ -145,14 +183,20 @@ def index_file(client, converter, chunker, path, source=None):
 
 
 def queue_file(name, temp_file, size, repo=db):
-    """Register a fully written temp file as a document and put it in the indexing queue. Returns the document id.
+    """Register a fully written temp file as the next version of the document `name` and queue it for indexing.
 
-    Raises db.Busy when a document with that name is being indexed right now.
+    Returns the version (see db.create_version). A file identical to the newest version is not queued again
+    ("created" is False) and the temp file is discarded.
     """
-    doc_id = repo.upsert_document(name, size)
-    storage.save(doc_id, name, temp_file)
-    repo.enqueue(doc_id)
-    return doc_id
+    with temp_file.open("rb") as f:
+        file_hash = hashlib.file_digest(f, "sha256").hexdigest()
+    version = repo.create_version(name, size, file_hash)
+    if not version["created"]:
+        temp_file.unlink(missing_ok=True)
+        return version
+    storage.save(version["file_path"], temp_file)
+    repo.enqueue(version["id"])
+    return version
 
 
 def main(argv):
@@ -175,14 +219,12 @@ def main(argv):
         else:
             seen.add(src.name)
             temp = storage.temp_dir() / uuid.uuid4().hex
-            try:
-                shutil.copyfile(src, temp)
-                queue_file(src.name, temp, src.stat().st_size)
+            shutil.copyfile(src, temp)
+            if queue_file(src.name, temp, src.stat().st_size)["created"]:
                 queued += 1
                 print(f"QUEUED    {src.name}")
-            except db.Busy:
-                temp.unlink(missing_ok=True)
-                problems.append((src, "is being indexed right now, try again later"))
+            else:
+                problems.append((src, "unchanged, already up to date"))
     for src, reason in problems:
         print(f"SKIPPED   {src.name}: {reason}")
     print(f"\nqueued={queued} skipped={len(problems)}")
