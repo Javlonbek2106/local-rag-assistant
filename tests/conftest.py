@@ -142,6 +142,8 @@ class FakeRepo:
         if version is None or version["status"] != "SUPERSEDED" or version["chunk_count"] is None:
             raise db.VersionConflict("Bu versiyaga qaytib bo'lmaydi")
         self.set_status(version["name"], version["version_number"], "READY", active=True)
+        self.generation = getattr(self, "generation", 0) + 1
+        return self.generation
 
 
 def _matches(payload, flt):

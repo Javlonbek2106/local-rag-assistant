@@ -330,6 +330,7 @@ def test_existing_documents_become_version_1_with_their_state_and_the_finished_o
         "queued.pdf": "QUEUED", "failed.pdf": "FAILED", "busy.pdf": "PROCESSING"}
     assert found["failed.pdf"]["state"] == "failed" and found["failed.pdf"]["error"] == "no text"
     assert db.active_version_ids() == [str(version["id"])]  # only the finished document is searchable
+    assert found["done.pdf"]["activation_generation"] == 0 and version["uploaded_generation"] == 0  # 0003 starts at 0
 
 
 def test_existing_work_in_the_queue_is_still_picked_up_after_the_migration(legacy_database):
