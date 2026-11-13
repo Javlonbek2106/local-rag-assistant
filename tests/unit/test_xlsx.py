@@ -98,3 +98,18 @@ def test_a_sheet_without_a_header_row_is_skipped_and_an_empty_workbook_is_unread
     assert texts(path) == []
     with pytest.raises(ingest.UnreadableDocument):
         ingest.xlsx_points(path, "src", "hash")
+
+
+def test_a_two_column_sheet_is_read_with_its_headers(tmp_path):
+    # the commonest spreadsheet of all: a name and a value (this used to produce no chunks and fail the document)
+    rows = [["Loyiha", "Byudjet"], ["Orion", 7350000], ["Vega", 1200000]]
+    path = make_workbook(tmp_path / "a.xlsx", {"Byudjet": rows})
+    first, second = texts(path)
+    assert "Loyiha: Orion" in first and "Byudjet: 7350000" in first and "Loyiha: Vega" in second
+
+
+def test_a_wide_header_still_wins_over_an_earlier_two_cell_line(tmp_path):
+    path = make_workbook(tmp_path / "a.xlsx", {"S": [
+        ["Hisobot", "2026-yil"], ["Nomi", "Reja", "Fakt"], ["Bino", 10, 9]]})
+    (only,) = texts(path)
+    assert "Reja: 10" in only and "Fakt: 9" in only and "Nomi: Bino" in only
