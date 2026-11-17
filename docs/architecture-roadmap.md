@@ -86,6 +86,13 @@ Bir-biriga bog'liq emas, parallel bajarish mumkin. Taxminiy umumiy hajm: 2–3 h
 | T0.5 | Yuklash tanasini `Content-Length` bo'yicha erta rad etish | API-02 | S | E5 tajribasi qayta: limitdan katta tana qabul qilinmaydi, vaqtinchalik papka o'sishi <5 MB |
 | T0.6 | UI fokusni saqlash, `aria-label`, `role="alert"`, `aria-live` | API-04 | S-M | e2e: fokus yangilanishdan keyin saqlanadi; savol maydonining kirish nomi bor; xato paneli e'lon qilinadi |
 
+### Bajarilish holati (2026-11-13)
+
+- **T0.1 va T0.2: amalga oshirildi, tasdiq kutilyapti** (commit qilinmagan). Hujjatlar: [backup-restore.md](backup-restore.md), [reconcile-and-status.md](reconcile-and-status.md). Qabul mezonlari natijalari shu hujjatlarda.
+- **T0.3 va T0.4: amalga oshirildi, tasdiq kutilyapti** (commit qilinmagan). Hujjatlar: [job-progress.md](job-progress.md), [llm-timeouts.md](llm-timeouts.md). Qabul mezonlari natijalari shu hujjatlarda.
+- **T0.5 va T0.6: amalga oshirildi, tasdiq kutilyapti** (commit qilinmagan, 2026-11-16). Hujjatlar: [upload-limits.md](upload-limits.md), [ui-accessibility.md](ui-accessibility.md). Qabul mezonlari natijalari shu hujjatlarda. T0.5 yakunlandi: `Content-Length`siz yuklash 411, jami so'rov ≤ 201 MB, sahifa fayllarni ketma-ket yuboradi (foydalanuvchi qarori); oqimli ko'p qismli tahlil (T1.3) hali bajarilmagan.
+- Faza 0 ning T0.1–T0.6 tugagan; qolgan ishlar alohida ruxsat bilan.
+
 ## 4. Faza 1: ishonchlilik va tiklash (P1)
 
 Faza 0 dan keyin; taxminan 4–6 hafta.

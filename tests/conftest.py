@@ -25,6 +25,12 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
+def no_warmup(monkeypatch):
+    """Starting the web server would load the real models in the background; tests never talk to a real Ollama."""
+    monkeypatch.setattr(config, "WARMUP", False)
+
+
+@pytest.fixture(autouse=True)
 def no_reranker(monkeypatch):
     """Unit tests must not load the cross-encoder model; tests that want re-ranking switch it on themselves."""
     monkeypatch.setattr(config, "RERANK_MODEL", "")
@@ -45,6 +51,32 @@ class FakeRepo:
     def migrate(self):
         self.migrated = True
 
+    def ping(self):
+        if getattr(self, "down", False):
+            raise ConnectionError("postgresql://rag:secret-password@db/rag refused the connection")
+
+    def status_snapshot(self):
+        by_status = {}
+        for v in self.versions:
+            by_status[v["status"]] = by_status.get(v["status"], 0) + 1
+        by_state = {}
+        for d in self.docs.values():
+            by_state[d["state"]] = by_state.get(d["state"], 0) + 1
+        in_flight = [{"document": v["name"], "version": v["version_number"], "stage": v["status"], "attempt": 1,
+                      "running_seconds": 5, "heartbeat_age_seconds": 1, "progress_unit": v.get("progress_unit"),
+                      "progress_done": v.get("progress_done"), "progress_total": v.get("progress_total"),
+                      "progress_age_seconds": 3 if v.get("progress_unit") else None}
+                     for v in self.versions if v["status"] in db.INFLIGHT]
+        errors = [{"document": v["name"], "version": v["version_number"], "status": v["status"],
+                   "error": v["error_message"], "at": None}
+                  for v in self.versions if v["error_message"] and v["status"] in ("FAILED", "QUEUED")]
+        searchable = sum(bool(d.get("version")) for d in self.docs.values())
+        return {"documents": {"total": len(self.docs), "searchable": searchable, "by_state": by_state},
+                "versions": {"total": len(self.versions), "by_status": by_status},
+                "in_flight_statuses": db.INFLIGHT, "queued": by_status.get("QUEUED", 0),
+                "oldest_queued_age_seconds": 30 if by_status.get("QUEUED") else None,
+                "in_flight": in_flight, "last_errors": errors}
+
     def _refresh(self, doc):
         mine = [v for v in self.versions if v["document_id"] == doc["id"]]
         active = next((v for v in mine if v["active"]), None)
@@ -59,6 +91,9 @@ class FakeRepo:
         else:
             state = "done" if active else "failed"
         failed = latest["status"] == "FAILED"
+        working = max((v for v in mine if v["status"] in db.INFLIGHT), key=lambda v: v["version_number"], default={})
+        doc.update(stage=working.get("status"), progress_unit=working.get("progress_unit"),
+                   progress_done=working.get("progress_done"), progress_total=working.get("progress_total"))
         doc.update(state=state, chunks=active["chunk_count"] if active else None, size_bytes=latest["file_size"],
                    version=active["version_number"] if active else None, latest_version=latest["version_number"],
                    error=latest["error_message"] if state == "failed" and failed else None,
@@ -95,6 +130,14 @@ class FakeRepo:
                     other.update(active=False, status="SUPERSEDED")
         version.update(status=status, chunk_count=chunks if chunks is not None else version["chunk_count"],
                        error_message=error, **({} if active is None else {"active": active}))
+        if status not in db.INFLIGHT:  # a position means something only while a worker holds the version
+            version.update(progress_unit=None, progress_done=None, progress_total=None)
+        self._refresh(self.docs[name])
+
+    def set_progress(self, name, number, unit, done, total=None):
+        """Test helper: where a version being indexed is (what the worker records in the progress columns)."""
+        version = next(v for v in self.versions if v["name"] == name and v["version_number"] == number)
+        version.update(progress_unit=unit, progress_done=done, progress_total=total)
         self._refresh(self.docs[name])
 
     def enqueue(self, version_id):
@@ -186,6 +229,27 @@ class FakeQdrant:
     def count(self, collection, count_filter=None, exact=True):
         found = [p for p in self.points.values() if count_filter is None or _matches(p[1], count_filter)]
         return models.CountResult(count=len(found))
+
+    def collection_exists(self, name):
+        return not getattr(self, "missing_collection", False)
+
+    def facet(self, collection, key, limit=10, exact=False, **kwargs):
+        counts = {}
+        for _vector, payload in self.points.values():
+            if payload.get(key) is not None:
+                counts[payload[key]] = counts.get(payload[key], 0) + 1
+        ordered = sorted(counts.items(), key=lambda item: -item[1])[:limit]
+        return SimpleNamespace(hits=[SimpleNamespace(value=value, count=n) for value, n in ordered])
+
+    def scroll(self, collection, scroll_filter=None, limit=10, offset=None, with_payload=True, with_vectors=False,
+               **kwargs):
+        found = [(pid, payload) for pid, (_v, payload) in self.points.items()
+                 if scroll_filter is None or _matches(payload, scroll_filter)]
+        start = offset or 0
+        page = found[start:start + limit]
+        shown = [SimpleNamespace(id=pid, payload=payload if with_payload is True else
+                                 {k: v for k, v in payload.items() if k in with_payload}) for pid, payload in page]
+        return shown, (start + limit if start + limit < len(found) else None)
 
     def set_payload(self, collection, payload, points):
         for _vector, existing in self.points.values():

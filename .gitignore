@@ -12,3 +12,7 @@ eval/reports/
 
 # uploaded documents (the app's own copies): never commit
 storage/
+
+# backups hold every document and the whole database; reports are local state
+backups/
+reports/

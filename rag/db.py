@@ -30,20 +30,26 @@ _INFLIGHT = "('PROCESSING', 'EMBEDDING', 'INDEXING', 'VERIFYING')"
 # the version back). Expiry is final: every call a worker makes on its version checks the lease, and none of them
 # renews an expired one, so a worker that stalled past the limit can never finish, even before anyone takes over.
 _LEASE = "heartbeat_at > now() - make_interval(secs => %(lease)s)"
+# Progress is only meaningful while a worker holds the version: every statement that releases it or moves it to a new
+# stage clears it, so a stale position is never shown for a job that is queued, failed or finished.
+_NO_PROGRESS = "progress_unit = NULL, progress_done = NULL, progress_total = NULL, progress_at = NULL"
 DOCUMENT_SELECT = f"""
     SELECT d.id, d.name, d.size_bytes, d.state, d.chunks, d.activation_generation,
            CASE WHEN d.state = 'failed' THEN d.error END AS error,
            CASE WHEN d.state = 'done' THEN d.error END AS update_error,
            d.created_at, d.updated_at, av.version_number AS version,
            (SELECT max(x.version_number) FROM document_versions x WHERE x.document_id = d.id) AS latest_version,
-           (SELECT extract(epoch FROM now() - x.started_at)::int FROM document_versions x
-             WHERE x.document_id = d.id AND x.status IN {_INFLIGHT} ORDER BY x.version_number DESC LIMIT 1) AS seconds
+           extract(epoch FROM now() - w.started_at)::int AS seconds,
+           w.status AS stage, w.progress_unit, w.progress_done, w.progress_total
     FROM documents d LEFT JOIN document_versions av ON av.id = d.active_version_id
+    LEFT JOIN LATERAL (SELECT x.status, x.started_at, x.progress_unit, x.progress_done, x.progress_total
+                       FROM document_versions x WHERE x.document_id = d.id AND x.status IN {_INFLIGHT}
+                       ORDER BY x.version_number DESC LIMIT 1) w ON true
 """
 VERSION_COLUMNS = f"""
     v.id, v.document_id, d.name, v.version_number, v.file_name, v.file_hash, v.file_size, v.file_path, v.status,
     v.chunk_count, v.error_message, v.attempts, v.claimed_by, v.created_at, v.indexed_at, v.activated_at,
-    v.uploaded_generation, d.activation_generation,
+    v.uploaded_generation, d.activation_generation, v.progress_unit, v.progress_done, v.progress_total,
     (d.active_version_id = v.id) AS active,
     CASE WHEN v.status IN {_INFLIGHT} THEN extract(epoch FROM now() - v.started_at)::int END AS seconds
 """
@@ -190,6 +196,45 @@ def queue_length():
         return conn.execute(sql).fetchone()["n"]
 
 
+def ping():
+    """PostgreSQL answers within a couple of seconds (the readiness check)."""
+    with pool().connection(timeout=2) as conn:
+        conn.execute("SELECT 1")
+
+
+def status_snapshot():
+    """The numbers behind /api/status, from the existing tables with read-only queries and a bounded result size
+    (at most 20 versions in flight and 10 recent errors, however many documents there are)."""
+    with pool().connection() as conn:
+        documents = conn.execute(
+            "SELECT count(*) AS total, count(*) FILTER (WHERE active_version_id IS NOT NULL) AS searchable "
+            "FROM documents").fetchone()
+        by_state = {r["state"]: r["n"] for r in conn.execute(
+            "SELECT state, count(*) AS n FROM documents GROUP BY state")}
+        by_status = {r["status"]: r["n"] for r in conn.execute(
+            "SELECT status, count(*) AS n FROM document_versions GROUP BY status")}
+        queue = conn.execute(
+            "SELECT count(*) AS queued, extract(epoch FROM now() - min(updated_at))::int AS oldest "
+            "FROM document_versions WHERE status = 'QUEUED'").fetchone()
+        in_flight = conn.execute(
+            f"SELECT d.name AS document, v.version_number AS version, v.status AS stage, v.attempts AS attempt, "
+            f"extract(epoch FROM now() - v.started_at)::int AS running_seconds, "
+            f"extract(epoch FROM now() - v.heartbeat_at)::int AS heartbeat_age_seconds, "
+            f"v.progress_unit, v.progress_done, v.progress_total, "
+            f"extract(epoch FROM now() - v.progress_at)::int AS progress_age_seconds "
+            f"FROM document_versions v JOIN documents d ON d.id = v.document_id "
+            f"WHERE v.status IN {_INFLIGHT} ORDER BY v.started_at LIMIT 20").fetchall()
+        errors = conn.execute(
+            "SELECT d.name AS document, v.version_number AS version, v.status, v.error_message AS error, "
+            "v.updated_at AS at FROM document_versions v JOIN documents d ON d.id = v.document_id "
+            "WHERE v.error_message IS NOT NULL AND v.status IN ('FAILED', 'QUEUED') "
+            "ORDER BY v.updated_at DESC LIMIT 10").fetchall()
+    return {"documents": {"total": documents["total"], "searchable": documents["searchable"], "by_state": by_state},
+            "versions": {"total": sum(by_status.values()), "by_status": by_status},
+            "in_flight_statuses": INFLIGHT, "queued": queue["queued"], "oldest_queued_age_seconds": queue["oldest"],
+            "in_flight": in_flight, "last_errors": errors}
+
+
 def delete_document(name):
     """Delete the document with all its versions and return its id; None if there is no such document.
     Raises Busy while any version is being indexed."""
@@ -266,7 +311,8 @@ def claim_next(worker_id):
             f"""
             WITH claimed AS (
                 UPDATE document_versions SET status = 'PROCESSING', claimed_by = %s, attempts = attempts + 1,
-                       chunk_count = NULL, started_at = now(), heartbeat_at = now(), updated_at = now()
+                       chunk_count = NULL, started_at = now(), heartbeat_at = now(), updated_at = now(),
+                       {_NO_PROGRESS}
                 WHERE id = (SELECT c.id FROM document_versions c
                             WHERE c.status = 'QUEUED'
                               AND NOT EXISTS (SELECT 1 FROM document_versions o
@@ -297,14 +343,30 @@ def heartbeat(version_id, worker_id):
 
 def set_stage(version_id, worker_id, status):
     """Move a held version to the next stage (PROCESSING, EMBEDDING, INDEXING, VERIFYING). False if the claim was lost
-    or the lease expired. The document stays 'processing' through all of them, so its summary does not change."""
+    or the lease expired. The document stays 'processing' through all of them, so its summary does not change. A new
+    stage starts without a position: the worker reports it again with set_progress()."""
     if status not in INFLIGHT:
         raise ValueError(status)
     with pool().connection() as conn:
         return conn.execute(
-            f"UPDATE document_versions SET status = %(status)s, heartbeat_at = now(), updated_at = now() "
+            f"UPDATE document_versions SET status = %(status)s, heartbeat_at = now(), updated_at = now(), "
+            f"{_NO_PROGRESS} "
             f"WHERE id = %(id)s AND claimed_by = %(worker)s AND status IN {_INFLIGHT} AND {_LEASE} RETURNING id",
             {"status": status, "id": version_id, "worker": worker_id, "lease": config.JOB_STALE_AFTER_S},
+        ).fetchone() is not None
+
+
+def set_progress(version_id, worker_id, unit, done, total=None):
+    """Record where a held version is, e.g. ("pages", 120, 381). False if the claim was lost or the lease expired:
+    like every other call of a worker, an expired worker writes nothing. It does not renew the lease (only heartbeat()
+    and set_stage() do), so reporting progress can never keep a worker alive that has stopped heartbeating."""
+    with pool().connection() as conn:
+        return conn.execute(
+            f"UPDATE document_versions SET progress_unit = %(unit)s, progress_done = %(done)s, "
+            f"progress_total = %(total)s, progress_at = now() "
+            f"WHERE id = %(id)s AND claimed_by = %(worker)s AND status IN {_INFLIGHT} AND {_LEASE} RETURNING id",
+            {"unit": unit, "done": done, "total": total, "id": version_id, "worker": worker_id,
+             "lease": config.JOB_STALE_AFTER_S},
         ).fetchone() is not None
 
 
@@ -353,7 +415,8 @@ def activate(version_id, worker_id, chunk_count):
             current = conn.execute("SELECT id, version_number FROM document_versions WHERE id = %s FOR UPDATE",
                                    (doc["active_version_id"],)).fetchone()
         rolled_back_since = mine["uploaded_generation"] < doc["activation_generation"]
-        released = "claimed_by = NULL, heartbeat_at = NULL, started_at = NULL, error_message = NULL, updated_at = now()"
+        released = (f"claimed_by = NULL, heartbeat_at = NULL, started_at = NULL, error_message = NULL, "
+                    f"updated_at = now(), {_NO_PROGRESS}")
         if rolled_back_since or (current and current["version_number"] > mine["version_number"]):
             conn.execute(f"UPDATE document_versions SET status = 'SUPERSEDED', chunk_count = %s, indexed_at = now(), "
                          f"{released} WHERE id = %s", (chunk_count, version_id))
@@ -414,7 +477,7 @@ def fail(version_id, worker_id, error, retry=True):
             UPDATE document_versions SET
                 status = CASE WHEN %(retry)s AND attempts < %(max)s THEN 'QUEUED' ELSE 'FAILED' END,
                 error_message = %(error)s, claimed_by = NULL, heartbeat_at = NULL, started_at = NULL,
-                updated_at = now()
+                updated_at = now(), {_NO_PROGRESS}
             WHERE id = %(id)s AND claimed_by = %(worker)s AND status IN {_INFLIGHT}
             RETURNING status, document_id
             """,
@@ -443,7 +506,7 @@ def requeue_stale(stale_after_s, uploading_after_s=900):
             UPDATE document_versions SET
                 status = CASE WHEN attempts < %(max)s THEN 'QUEUED' ELSE 'FAILED' END,
                 error_message = 'Indekslash jarayoni to''xtab qoldi', claimed_by = NULL, heartbeat_at = NULL,
-                started_at = NULL, updated_at = now()
+                started_at = NULL, updated_at = now(), {_NO_PROGRESS}
             WHERE id IN (SELECT id FROM document_versions WHERE status IN {_INFLIGHT}
                          AND heartbeat_at < now() - make_interval(secs => %(stale)s) FOR UPDATE SKIP LOCKED)
             RETURNING document_id

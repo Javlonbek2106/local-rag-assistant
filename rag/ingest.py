@@ -16,6 +16,8 @@ from pathlib import Path
 from rag import config, db, llm, storage, store
 
 log = logging.getLogger(__name__)
+CHUNK_REPORT_EVERY = 25  # how often cutting reports the number of chunks so far (each report is one database write)
+UPLOAD_BATCH = 64
 
 
 class UnreadableDocument(ValueError):
@@ -71,13 +73,29 @@ def _markdown_tables_provider():
     return MarkdownTablesProvider()
 
 
-def convert(converter, path):
+def _docling_progress(report):
+    """Docling's progress events as positions: pages done of pages in all, then "assembling" once the pages are read.
+    Docling swallows an exception raised inside its callback, so this never raises."""
+    from docling.datamodel.progress import ConversionPhase, PageCompletedProgress, PhaseStartedProgress
+
+    def on_event(event):
+        if isinstance(event, PageCompletedProgress):
+            report("pages", event.completed_pages, event.total_pages)
+        elif isinstance(event, PhaseStartedProgress) and event.phase == ConversionPhase.ASSEMBLE:
+            report("assembling", 0, None)
+
+    return on_event
+
+
+def convert(converter, path, progress=None):
+    """Parse a file into a Docling document. `progress(unit, done, total)` hears about each finished page."""
+    options = {} if progress is None else {"progress_callback": _docling_progress(progress)}
     if path.suffix.lower() == ".txt":  # Docling has no plain-text input; Markdown parses it fine
         from docling.datamodel.base_models import DocumentStream
 
         stream = DocumentStream(name=f"{path.stem}.md", stream=BytesIO(path.read_bytes()))
-        return converter.convert(stream).document
-    return converter.convert(path).document
+        return converter.convert(stream, **options).document
+    return converter.convert(path, **options).document
 
 
 def _require_text(items):
@@ -118,14 +136,19 @@ def _make_points(items, source, file_name, file_hash):
     return _points(items, llm.embed([text for text, _, _ in items]), source, file_name, file_hash)
 
 
-def document_items(document, chunker):
-    chunks = list(chunker.chunk(document))
-    return [
-        (chunker.contextualize(chunk),
-         sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}),
-         chunk.meta.headings or [])
-        for chunk in chunks
-    ]
+def document_items(document, chunker, progress=None):
+    """Cut a parsed document into (text, pages, headings) chunks. `progress` hears the number cut so far, every
+    CHUNK_REPORT_EVERY chunks: how many there will be is not known until the end."""
+    if progress:
+        progress("chunks", 0, None)
+    items = []
+    for chunk in chunker.chunk(document):
+        items.append((chunker.contextualize(chunk),
+                      sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}),
+                      chunk.meta.headings or []))
+        if progress and len(items) % CHUNK_REPORT_EVERY == 0:
+            progress("chunks", len(items), None)
+    return items
 
 
 def build_points(document, chunker, source, file_name, file_hash):
@@ -139,13 +162,32 @@ def xlsx_points(path, source, file_hash):
     return _make_points(xlsx.chunks(path), source, path.name, file_hash)
 
 
-def extract_items(converter, chunker, path):
+def extract_items(converter, chunker, path, progress=None):
     """Parse a file and cut it into (text, pages, headings) chunks."""
     if path.suffix.lower() == ".xlsx":
         from rag import xlsx
 
         return xlsx.chunks(path)
-    return document_items(convert(converter, path), chunker)
+    return document_items(convert(converter, path, progress), chunker, progress)
+
+
+def _embed(texts, report):
+    """Vectors for the texts, one Ollama call per batch, with the position reported between the calls."""
+    vectors = []
+    report("chunks", 0, len(texts))
+    for start in range(0, len(texts), config.EMBED_BATCH):
+        vectors += llm.embed(texts[start : start + config.EMBED_BATCH])
+        report("chunks", len(vectors), len(texts))
+    return vectors
+
+
+def _upload(client, points, report):
+    """Write the points in batches, with the position reported after each."""
+    report("chunks", 0, len(points))
+    for start in range(0, len(points), UPLOAD_BATCH):
+        client.upload_points(config.COLLECTION, points=points[start : start + UPLOAD_BATCH], batch_size=UPLOAD_BATCH,
+                             wait=True)
+        report("chunks", min(start + UPLOAD_BATCH, len(points)), len(points))
 
 
 def index_version(client, converter, chunker, path, *, document_id, version_id, file_name, file_hash,
@@ -153,17 +195,22 @@ def index_version(client, converter, chunker, path, *, document_id, version_id, 
     """Index one document version into its own set of Qdrant points and return the number of chunks written.
 
     `stage` is told EMBEDDING and INDEXING as the work reaches them (the worker records them, and raises to stop if
-    its claim was lost). The version's chunks from an earlier attempt are removed first, so a retry never leaves
-    leftovers; no other version is touched. Verifying and activating are the caller's job.
+    its claim was lost). If it also has a `progress(unit, done, total)` method (the worker's JobProgress does), that
+    hears pages parsed, chunks cut, chunks embedded and chunks written, which is what the worker's stall limit and the
+    page's progress display are made of. The version's chunks from an earlier attempt are removed first, so a retry
+    never leaves leftovers; no other version is touched. Verifying and activating are the caller's job.
     """
-    items = extract_items(converter, chunker, path)
+    report = getattr(stage, "progress", None)
+    items = (extract_items(converter, chunker, path) if report is None
+             else extract_items(converter, chunker, path, report))
+    report = report or (lambda unit, done, total=None: None)
     _require_text(items)
     stage("EMBEDDING")
-    vectors = llm.embed([text for text, _, _ in items])
+    vectors = _embed([text for text, _, _ in items], report)
     points = _points(items, vectors, str(document_id), file_name, file_hash, document_id, version_id)
     stage("INDEXING")
     store.delete_version(client, version_id)
-    client.upload_points(config.COLLECTION, points=points, batch_size=64, wait=True)
+    _upload(client, points, report)
     return len(points)
 
 

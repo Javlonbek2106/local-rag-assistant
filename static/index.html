@@ -12,30 +12,35 @@
     <h1>Hujjatlar yordamchisi</h1>
     <span class="muted">Hamma narsa shu kompyuterda ishlaydi</span>
   </header>
-  <div id="banner" class="banner" hidden></div>
+  <div id="banner" class="banner" role="alert" hidden></div>
   <main>
-    <aside>
+    <aside aria-label="Hujjatlar">
       <h2>Hujjatlar</h2>
-      <label id="drop" class="drop" tabindex="0">
+      <label id="drop" class="drop" tabindex="0" role="button">
         <input id="file-input" type="file" multiple hidden>
         <strong>Fayllarni shu yerga tashlang</strong>
         <span class="muted">yoki bosib tanlang<br>PDF, Word, Excel, PowerPoint, HTML, rasm, matn</span>
       </label>
-      <div id="upload-msg" class="upload-msg" hidden></div>
-      <ul id="docs" class="docs"></ul>
+      <div id="upload-status" class="upload-status" role="status" aria-live="polite" hidden></div>
+      <progress id="upload-progress" class="bar upload-bar" aria-label="Fayllarni yuklash taraqqiyoti" hidden></progress>
+      <div id="upload-msg" class="upload-msg" role="alert" hidden></div>
+      <ul id="docs" class="docs" aria-label="Hujjatlar ro'yxati"></ul>
       <p id="docs-empty" class="muted" hidden>Hozircha hujjat yo'q.</p>
     </aside>
-    <section class="chat">
+    <section class="chat" aria-label="Savol-javob">
       <h2>Savol-javob</h2>
-      <div id="log" class="log" aria-live="polite">
+      <div id="log" class="log" role="log" aria-label="Savol-javob tarixi" aria-live="polite" aria-busy="false">
         <p id="hint" class="muted">Hujjatlar tayyor bo'lgach, savolingizni yozing. Javob faqat shu hujjatlardan olinadi va manbasi ko'rsatiladi.</p>
       </div>
       <form id="ask-form" class="ask">
-        <textarea id="question" rows="2" maxlength="2000" placeholder="Savolingizni yozing… (Enter — yuborish, Shift+Enter — yangi qator)" required></textarea>
+        <label for="question" class="sr-only">Savolingiz</label>
+        <span id="question-help" class="sr-only">Enter — yuborish, Shift+Enter — yangi qator</span>
+        <textarea id="question" rows="2" maxlength="2000" aria-describedby="question-help" placeholder="Savolingizni yozing… (Enter — yuborish, Shift+Enter — yangi qator)" required></textarea>
         <button id="send" type="submit">Yuborish</button>
       </form>
     </section>
   </main>
+  <div id="sr-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -10,6 +10,28 @@ const PHASE_TEXT = {
   failed: "Xato",
 };
 
+// What a version being indexed is doing, from its stage and the position the worker reports ({unit, done, total}).
+const STAGE_TEXT = {
+  PROCESSING: "Tahlil qilinmoqda",
+  EMBEDDING: "Embedding hisoblanmoqda",
+  INDEXING: "Indekslanmoqda",
+  VERIFYING: "Tekshirilmoqda",
+};
+
+function percent(p) {
+  return p && p.total ? Math.min(100, Math.floor((p.done * 100) / p.total)) : null;
+}
+
+function workText(stage, p) {
+  const base = STAGE_TEXT[stage] || "Ishlanmoqda";
+  if (!p) return `${base}…`;
+  const pct = percent(p) === null ? "" : ` (${percent(p)}%)`;
+  if (p.unit === "pages") return p.total ? `${base}: ${p.done}/${p.total} sahifa${pct}` : `${base}: ${p.done} sahifa`;
+  if (p.unit === "assembling") return `${base}: hujjat yig'ilmoqda…`;
+  if (stage === "PROCESSING") return `Bo'laklarga bo'linmoqda: ${p.done} ta`; // the total is not known while cutting
+  return p.total ? `${base}: ${p.done}/${p.total} bo'lak${pct}` : `${base}: ${p.done} bo'lak`;
+}
+
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -17,13 +39,57 @@ function el(tag, className, text) {
   return node;
 }
 
+// The page is refreshed by polling. Updating a node only when something about it really changed keeps the nodes (and the
+// keyboard focus on them) alive and does not make a screen reader read the same thing again.
+function setText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
+function setClass(node, name) {
+  if (node.className !== name) node.className = name;
+}
+
+function setAttr(node, name, value) {
+  const text = String(value);
+  if (node.getAttribute(name) !== text) node.setAttribute(name, text);
+}
+
+// ---------- screen readers and keyboard focus ----------
+// One polite live region for the few things worth saying aloud (a document became ready, failed, passed a quarter of its
+// indexing). The visible texts are not live regions: a progress text that changes every second would be read every second.
+function announce(text) {
+  const region = $("sr-status");
+  if (text && region.textContent !== text) region.textContent = text;
+}
+
+// Run a DOM update and make sure the keyboard focus is where it was. The updates below change nodes in place, so the focused
+// node normally survives and nothing needs to be done; if it was replaced anyway (it has a data-focus-key), the node with the
+// same key is focused again, with its text selection. Focus that the user has moved elsewhere is never taken back.
+function withFocusKept(update) {
+  const active = document.activeElement;
+  const key = active && active.dataset ? active.dataset.focusKey : undefined;
+  const selection = active && typeof active.selectionStart === "number"
+    ? [active.selectionStart, active.selectionEnd, active.selectionDirection] : null;
+  update();
+  const now = document.activeElement;
+  if (key === undefined || (now && now !== document.body)) return; // nothing was lost, or the user moved on
+  const next = [...document.querySelectorAll("[data-focus-key]")].find((node) => node.dataset.focusKey === key);
+  if (!next) return;
+  next.focus({ preventScroll: true });
+  if (selection && typeof next.setSelectionRange === "function") {
+    try { next.setSelectionRange(...selection); } catch { /* not a text field */ }
+  }
+}
+
 function showBanner(text) {
-  $("banner").hidden = !text;
-  $("banner").textContent = text || "";
+  const banner = $("banner");
+  banner.hidden = !text;
+  setText(banner, text || "");
 }
 
 // ---------- documents ----------
 let docsTimer = null;
+let lastDocs = [];
 
 async function refreshDocs() {
   clearTimeout(docsTimer);
@@ -31,6 +97,7 @@ async function refreshDocs() {
   try {
     const res = await fetch("/api/documents");
     const data = await res.json();
+    lastDocs = data.documents;
     renderDocs(data.documents);
     showBanner(data.error);
     if (data.documents.some((d) => d.state === "queued" || d.state === "processing")) delay = 1500;
@@ -43,11 +110,14 @@ async function refreshDocs() {
 
 const openPanels = new Set(); // names of the documents whose versions are shown
 const armed = new Map(); // two-click confirmations: key -> time until which the second click counts
+const views = new Map(); // document name -> the row that shows it
+let firstRender = true;
 
 // A document that has an active version can always be asked about, whatever else is happening to it: it is shown as
 // ready, and what happens to its newer version goes on a line of its own.
 function statusOf(doc) {
   if (doc.searchable) return { cls: "done", text: `Tayyor · v${doc.version} · ${doc.chunks} bo'lak` };
+  if (doc.state === "processing") return { cls: "processing", text: workText(doc.stage, doc.progress) };
   return { cls: doc.state, text: doc.state === "done" ? `Tayyor · ${doc.chunks} bo'lak` : STATE_TEXT[doc.state] || doc.state };
 }
 
@@ -55,76 +125,212 @@ function updateLine(doc) {
   if (!doc.searchable) return null;
   const newer = `v${doc.latest_version}`;
   if (doc.update_error) return { cls: "bad", text: `${newer} yangilanmadi: ${doc.update_error} (v${doc.version} ishlashda davom etadi)` };
-  if (doc.state === "processing") return { cls: "warn", text: `${newer} ishlanmoqda… (hozircha v${doc.version} dan javob beriladi)` };
+  if (doc.state === "processing") return { cls: "warn", text: `${newer}: ${workText(doc.stage, doc.progress)} (hozircha v${doc.version} dan javob beriladi)` };
   if (doc.state === "queued") return { cls: "warn", text: `${newer} navbatda (hozircha v${doc.version} dan javob beriladi)` };
   return null;
 }
 
-function renderDocs(documents) {
-  const list = $("docs");
-  list.replaceChildren();
-  $("docs-empty").hidden = documents.length > 0;
-  for (const doc of documents) {
-    const row = el("li");
-    row.append(el("span", "name", doc.name));
-    row.append(deleteButton(doc.name));
-    const status = statusOf(doc);
-    row.append(el("span", `state ${status.cls}`, status.text));
-    row.append(versionsToggle(doc.name));
-    const update = updateLine(doc);
-    if (update) row.append(el("span", `update ${update.cls}`, update.text));
-    if (doc.error) row.append(el("span", "err", doc.error));
-    if (openPanels.has(doc.name)) row.append(versionsPanel(doc.name));
-    list.append(row);
+// Add or remove an optional part of a row; returns it (or null). `before` is the node it must come in front of.
+function optional(holder, field, want, make, before) {
+  if (want && !holder[field]) {
+    holder[field] = make();
+    holder.li.insertBefore(holder[field], before || null);
+  } else if (!want && holder[field]) {
+    holder[field].remove();
+    holder[field] = null;
   }
+  return holder[field];
 }
 
-function versionsToggle(name) {
-  const open = openPanels.has(name);
-  const button = el("button", "link", open ? "Versiyalarni yopish" : "Versiyalar");
+function createRow(name) {
+  const view = { name, li: el("li"), bar: null, update: null, err: null, panel: null, last: undefined, asked: 0, shown: 0 };
+  view.nameEl = el("span", "name", name);
+  view.del = deleteButton(name);
+  view.state = el("span", "state");
+  view.toggle = versionsToggle(view);
+  view.li.append(view.nameEl, view.del, view.state, view.toggle);
+  return view;
+}
+
+function updateRow(view, doc) {
+  const status = statusOf(doc);
+  setText(view.state, status.text);
+  setClass(view.state, `state ${status.cls}`);
+
+  const total = doc.state === "processing" && doc.progress && doc.progress.total ? doc.progress.total : 0;
+  const bar = optional(view, "bar", total > 0, () => el("progress", "bar"), view.toggle);
+  if (bar) {
+    const done = Math.min(doc.progress.done, total);
+    setAttr(bar, "max", total);
+    setAttr(bar, "value", done);
+    setAttr(bar, "aria-label", `${doc.name}: indekslash taraqqiyoti`);
+    setAttr(bar, "aria-valuemin", 0);
+    setAttr(bar, "aria-valuemax", total);
+    setAttr(bar, "aria-valuenow", done);
+    setAttr(bar, "aria-valuetext", workText(doc.stage, doc.progress));
+  }
+
+  const open = openPanels.has(view.name);
+  setText(view.toggle, open ? "Versiyalarni yopish" : "Versiyalar");
+  setAttr(view.toggle, "aria-expanded", open);
+  setAttr(view.toggle, "aria-label", `${open ? "Versiyalarni yopish" : "Versiyalar"}: ${view.name}`);
+
+  const update = updateLine(doc);
+  const line = optional(view, "update", !!update, () => el("span"), view.err || view.panel);
+  if (line) {
+    setText(line, update.text);
+    setClass(line, `update ${update.cls}`);
+  }
+  const err = optional(view, "err", !!doc.error, () => {
+    const node = el("span", "err");
+    node.setAttribute("role", "alert");
+    return node;
+  }, view.panel);
+  if (err) setText(err, doc.error);
+
+  const panel = optional(view, "panel", open, () => makePanel(view));
+  if (panel) refreshPanel(view);
+  announceChange(view, doc);
+}
+
+// Say it aloud when something worth knowing happens to a document, not at every poll and not for the whole list at load.
+function announceChange(view, doc) {
+  const stage = doc.state === "processing" ? doc.stage : null;
+  const pct = percent(doc.progress);
+  const key = `${doc.state}|${stage}|${doc.version}|${pct === null ? "-" : Math.floor(pct / 25)}`;
+  const previous = view.last;
+  view.last = key;
+  if (firstRender || previous === key) return;
+  if (doc.state === "processing") announce(`${doc.name}: ${workText(doc.stage, doc.progress)}`);
+  else if (doc.state === "done") announce(`${doc.name}: tayyor`);
+  else if (doc.state === "failed") announce(`${doc.name}: xato. ${doc.error || ""}`);
+  else if (doc.state === "queued") announce(`${doc.name}: navbatda`);
+}
+
+function renderDocs(documents) {
+  withFocusKept(() => {
+    const list = $("docs");
+    $("docs-empty").hidden = documents.length > 0;
+    const names = new Set(documents.map((d) => d.name));
+    for (const [name, view] of views) {
+      if (!names.has(name)) { view.li.remove(); views.delete(name); }
+    }
+    documents.forEach((doc, index) => {
+      let view = views.get(doc.name);
+      if (!view) { view = createRow(doc.name); views.set(doc.name, view); }
+      updateRow(view, doc);
+      // Only a row that is not where it belongs is moved (a moved node loses focus); a new row goes in without moving the others.
+      if (list.children[index] !== view.li) list.insertBefore(view.li, list.children[index] || null);
+    });
+  });
+  firstRender = false;
+}
+
+function versionsToggle(view) {
+  const button = el("button", "link", "Versiyalar");
+  button.dataset.focusKey = `doc:${view.name}:versions`;
+  button.setAttribute("aria-expanded", "false");
   button.addEventListener("click", () => {
-    if (open) openPanels.delete(name); else openPanels.add(name);
-    refreshDocs();
+    if (openPanels.has(view.name)) openPanels.delete(view.name); else openPanels.add(view.name);
+    renderDocs(lastDocs);
   });
   return button;
 }
 
 // Every version of a document with its own state. A version that was indexed but is not active can be made active.
-function versionsPanel(name) {
+function makePanel(view) {
   const panel = el("div", "versions");
-  panel.append(el("span", "muted", "Yuklanmoqda…"));
-  fetch(`/api/documents/${encodeURIComponent(name)}/versions`)
-    .then((res) => res.json())
-    .then((data) => {
-      panel.replaceChildren();
-      for (const v of data.versions) panel.append(versionRow(name, v, panel));
-    })
-    .catch(() => panel.replaceChildren(el("span", "err", "Versiyalarni o'qib bo'lmadi")));
+  panel.setAttribute("role", "group");
+  panel.setAttribute("aria-label", `Versiyalar: ${view.name}`);
+  view.message = el("span", "muted", "Yuklanmoqda…");
+  view.list = el("div", "vlist");
+  view.rows = new Map();
+  view.notice = null;
+  view.shown = view.asked; // what was asked for before this panel existed is older than the panel and never shown in it
+  panel.append(view.message, view.list);
   return panel;
 }
 
-function versionRow(name, v, panel) {
-  const row = el("div", `ver ${v.phase}`);
-  row.append(el("span", "vnum", `v${v.version}`));
-  let text = PHASE_TEXT[v.phase] || v.phase;
-  if (v.stale) text += " · rollbackdan keyin faol bo'lmaydi";
-  if (v.chunks) text += ` · ${v.chunks} bo'lak`;
-  row.append(el("span", `phase ${v.phase}`, text));
-  if (v.error) row.append(el("span", "err", v.error));
-  if (v.phase === "superseded") row.append(restoreButton(name, v.version, panel));
-  return row;
+// Every request gets a number; an answer is shown only if it is newer than what the panel shows already. Answers can come
+// back in any order (a poll that was asked a moment before a rollback may be answered after the request that follows it),
+// and an older one must never put the panel back to a state that has been left.
+async function refreshPanel(view) {
+  const number = ++view.asked;
+  try {
+    const res = await fetch(`/api/documents/${encodeURIComponent(view.name)}/versions`);
+    const data = await res.json();
+    if (!res.ok || !data.versions) throw new Error("versions");
+    if (view.panel && number > view.shown) {
+      view.shown = number;
+      withFocusKept(() => syncVersions(view, data.versions));
+    }
+  } catch {
+    if (view.panel && number > view.shown) {
+      view.shown = number;
+      setText(view.message, "Versiyalarni o'qib bo'lmadi");
+      setClass(view.message, "err");
+      view.message.setAttribute("role", "alert");
+    }
+  }
 }
 
-function restoreButton(name, version, panel) {
+function syncVersions(view, versions) {
+  view.message.remove();
+  if (view.notice) { view.notice.remove(); view.notice = null; }
+  const wanted = new Set(versions.map((v) => v.version));
+  for (const [number, row] of view.rows) {
+    if (!wanted.has(number)) { row.el.remove(); view.rows.delete(number); }
+  }
+  versions.forEach((v, index) => {
+    let row = view.rows.get(v.version);
+    if (!row) {
+      row = { el: el("div"), li: null, number: v.version, err: null, button: null };
+      row.li = row.el; // `optional` adds parts to `holder.li`
+      row.vnum = el("span", "vnum");
+      row.phase = el("span");
+      row.el.append(row.vnum, row.phase);
+      view.rows.set(v.version, row);
+    }
+    updateVersionRow(view, row, v);
+    if (view.list.children[index] !== row.el) view.list.insertBefore(row.el, view.list.children[index] || null);
+  });
+}
+
+function updateVersionRow(view, row, v) {
+  setClass(row.el, `ver ${v.phase}`);
+  setText(row.vnum, `v${v.version}`);
+  let text = v.phase === "processing" ? workText(v.status, v.progress) : PHASE_TEXT[v.phase] || v.phase;
+  if (v.stale) text += " · rollbackdan keyin faol bo'lmaydi";
+  if (v.chunks) text += ` · ${v.chunks} bo'lak`;
+  setText(row.phase, text);
+  setClass(row.phase, `phase ${v.phase}`);
+  const err = optional(row, "err", !!v.error, () => {
+    const node = el("span", "err");
+    node.setAttribute("role", "alert");
+    return node;
+  }, row.button);
+  if (err) setText(err, v.error);
+  optional(row, "button", v.phase === "superseded", () => restoreButton(view, v.version));
+}
+
+function restoreButton(view, version) {
+  const name = view.name;
   const key = `${name}#${version}`;
   const label = "Shu versiyani faol qilish";
   const isArmed = () => (armed.get(key) || 0) > Date.now();
-  const button = el("button", "", isArmed() ? "Aniqmi?" : label);
+  const button = el("button", "");
+  button.dataset.focusKey = `ver:${key}`;
+  const show = () => {
+    setText(button, isArmed() ? "Aniqmi?" : label);
+    setAttr(button, "aria-label", `${isArmed() ? "Aniqmi? " : ""}${label}: ${name} v${version}`);
+  };
+  show();
   button.addEventListener("click", async () => {
     if (!isArmed()) {
       armed.set(key, Date.now() + 3000);
-      button.textContent = "Aniqmi?";
-      setTimeout(() => { armed.delete(key); button.textContent = label; }, 3000);
+      show();
+      announce("Tasdiqlash uchun yana bir marta bosing");
+      setTimeout(() => { armed.delete(key); show(); }, 3000);
       return;
     }
     armed.delete(key);
@@ -136,10 +342,16 @@ function restoreButton(name, version, panel) {
     });
     if (!res.ok) {
       const detail = (await res.json().catch(() => ({}))).detail;
-      panel.prepend(el("span", "err", `Qaytib bo'lmadi: ${detail || `HTTP ${res.status}`}`));
+      if (view.notice) view.notice.remove();
+      view.notice = el("span", "err", `Qaytib bo'lmadi: ${detail || `HTTP ${res.status}`}`);
+      view.notice.setAttribute("role", "alert");
+      view.panel.insertBefore(view.notice, view.list);
       button.disabled = false;
       return;
     }
+    // The panel first, then the list: the panel is asked for at once and the header (which comes with the list) is
+    // updated only after the panel shows the restored version, so the header can never be ahead of the panel.
+    await refreshPanel(view);
     refreshDocs();
   });
   return button;
@@ -147,12 +359,19 @@ function restoreButton(name, version, panel) {
 
 function deleteButton(name) {
   const button = el("button", "danger", "O'chirish");
-  let armed = false;
+  button.dataset.focusKey = `doc:${name}:delete`;
+  const show = (armedNow) => {
+    setText(button, armedNow ? "Aniqmi?" : "O'chirish");
+    setAttr(button, "aria-label", `${armedNow ? "Aniqmi? " : ""}O'chirish: ${name}`);
+  };
+  show(false);
+  let armedNow = false;
   button.addEventListener("click", async () => {
-    if (!armed) {
-      armed = true;
-      button.textContent = "Aniqmi?";
-      setTimeout(() => { armed = false; button.textContent = "O'chirish"; }, 3000);
+    if (!armedNow) {
+      armedNow = true;
+      show(true);
+      announce("Tasdiqlash uchun yana bir marta bosing");
+      setTimeout(() => { armedNow = false; show(false); }, 3000);
       return;
     }
     button.disabled = true;
@@ -162,20 +381,71 @@ function deleteButton(name) {
   return button;
 }
 
-async function uploadFiles(files) {
-  if (!files.length) return;
+// Every file is sent in a request of its own, one after the other (the server limits the size of a whole request, and a
+// failure of one file must not take the others with it). A file is handed to the server, and so to the indexing, as soon
+// as its own request has finished; whatever goes wrong with one file is reported under its name and the rest go on.
+let uploadQueue = Promise.resolve(); // a selection made while an upload is running waits for it: never two at once
+let uploadRun = 0;
+
+function uploadFiles(files) {
+  if (!files.length) return uploadQueue;
+  uploadQueue = uploadQueue.then(() => uploadSequence(files));
+  return uploadQueue;
+}
+
+async function sendOne(file) {
   const form = new FormData();
-  for (const file of files) form.append("files", file);
-  const msg = $("upload-msg");
+  form.append("files", file);
   try {
     const res = await fetch("/api/documents", { method: "POST", body: form });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const rejected = (await res.json()).results.filter((r) => !r.accepted);
-    msg.hidden = rejected.length === 0;
-    msg.textContent = rejected.map((r) => `${r.name}: ${r.error}`).join(" · ");
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => ({}))).detail; // e.g. 413: larger than the limit, 411: no length
+      return { name: file.name, ok: false, error: detail || `HTTP ${res.status}` };
+    }
+    const result = (await res.json()).results[0]; // one file was sent: one result
+    if (!result || !result.accepted) return { name: file.name, ok: false, error: (result && result.error) || "Qabul qilinmadi" };
+    return { name: file.name, ok: true };
   } catch (error) {
+    return { name: file.name, ok: false, error: `Server bilan aloqa uzildi (${error.message})` };
+  }
+}
+
+function showUploadProgress(done, total, text) {
+  const bar = $("upload-progress");
+  bar.hidden = false;
+  setAttr(bar, "max", total);
+  setAttr(bar, "value", done);
+  setAttr(bar, "aria-valuemin", 0);
+  setAttr(bar, "aria-valuemax", total);
+  setAttr(bar, "aria-valuenow", done);
+  setAttr(bar, "aria-valuetext", text);
+  $("upload-status").hidden = false;
+  setText($("upload-status"), text); // a polite live region: it is read when it changes (once per file)
+}
+
+async function uploadSequence(files) {
+  const run = ++uploadRun;
+  const msg = $("upload-msg");
+  msg.hidden = true;
+  msg.textContent = "";
+  const results = [];
+  for (const [index, file] of files.entries()) {
+    showUploadProgress(index, files.length, `${index + 1}/${files.length} fayl yuklanmoqda: ${file.name}`);
+    results.push(await sendOne(file));
+    refreshDocs(); // the document appears in the list (and the worker can start on it) without waiting for the others
+  }
+  const failed = results.filter((r) => !r.ok);
+  const summary = failed.length === 0
+    ? `${files.length}/${files.length} fayl yuklandi`
+    : `${results.length - failed.length} ta fayl muvaffaqiyatli, ${failed.length} ta faylda xatolik`;
+  showUploadProgress(files.length, files.length, summary);
+  if (failed.length) {
     msg.hidden = false;
-    msg.textContent = `Yuklab bo'lmadi: ${error.message}`;
+    msg.textContent = failed.map((r) => `${r.name}: ${r.error}`).join(" · "); // each error under the file's own name
+  } else {
+    setTimeout(() => { // a success needs no permanent line; a newer upload keeps its own
+      if (run === uploadRun) { $("upload-status").hidden = true; $("upload-progress").hidden = true; }
+    }, 6000);
   }
   refreshDocs();
 }
@@ -212,10 +482,17 @@ function renderSources(node, sources) {
   node.append(details);
 }
 
+// While an answer is being written the log is "busy": a screen reader waits and reads it once when it is finished,
+// instead of reading every few words as they arrive.
+function setBusy(busy) {
+  $("log").setAttribute("aria-busy", String(busy));
+}
+
 async function ask(question) {
   addMessage("user", question);
   const bot = addMessage("bot", "…");
   let text = "";
+  setBusy(true);
   try {
     const res = await fetch("/api/ask", {
       method: "POST",
@@ -243,6 +520,7 @@ async function ask(question) {
           throw new Error(event.error);
         } else if (event.final !== undefined) {
           bot.textContent = event.final;
+          if (event.truncated) bot.append(el("div", "muted", "Javob uzunlik chegarasiga yetdi va shu yerda uzildi."));
           if (event.sources.length) renderSources(bot, event.sources);
         }
         $("log").scrollTop = $("log").scrollHeight;
@@ -250,8 +528,13 @@ async function ask(question) {
       if (done) break;
     }
   } catch (error) {
+    setBusy(false); // before the alert is added, so that it is spoken at once
     bot.classList.add("error");
-    bot.textContent = `Xato: ${error.message}`;
+    const alert = el("span", "", `Xato: ${error.message}`); // "Xato:" in words: the red colour is not the only sign
+    alert.setAttribute("role", "alert");
+    bot.replaceChildren(alert);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -263,7 +546,10 @@ $("ask-form").addEventListener("submit", async (e) => {
   $("send").disabled = true;
   await ask(question);
   $("send").disabled = false;
-  $("question").focus();
+  // Give the focus back only if it was lost (it sat on the send button, which was disabled meanwhile) or is still on the
+  // question. If the user has moved to something else while the answer was written, that choice stands.
+  const now = document.activeElement;
+  if (!now || now === document.body || now === $("send") || now === $("question")) $("question").focus();
 });
 $("question").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("ask-form").requestSubmit(); }

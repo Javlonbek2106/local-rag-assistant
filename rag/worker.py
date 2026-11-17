@@ -3,9 +3,10 @@
     python -m rag.worker      one worker (loads the parsing models, then loops)
     python -m rag worker      the same under a supervisor that restarts it
 
-While a document is processed a guard thread sends heartbeats and enforces the time limit. A stuck parser cannot
-be killed from inside a Python process, so on timeout the worker exits with EXIT_RESTART and the supervisor starts
-a fresh one. If the whole process dies, its documents are put back in the queue by whichever worker is alive.
+While a document is processed a guard thread sends heartbeats and enforces the time limits: a job fails when its
+progress (page, chunk, stage) stops moving, not when it merely runs long. A stuck parser cannot be killed from inside a
+Python process, so on timeout the worker exits with EXIT_RESTART and the supervisor starts a fresh one. If the whole
+process dies, its documents are put back in the queue by whichever worker is alive.
 """
 import hashlib
 import logging
@@ -42,11 +43,64 @@ def purge_orphans(client, known_ids):
     return len(orphans)
 
 
-class JobGuard:
-    """While one document is processed: heartbeats, loss-of-claim detection and the time limit."""
+UNIT_TEXT = {"pages": "sahifa", "assembling": "hujjat yig'ilmoqda", "chunks": "bo'lak"}
 
-    def __init__(self, repo, job, worker_id, on_timeout):
+
+class JobProgress:
+    """What a running job says about itself, for two readers: the database (the page shows it) and JobGuard (a job whose
+    position has not moved for JOB_STALL_S is stuck).
+
+    `ingest.index_version` gets this object as its `stage` callback: calling it moves the job to the next stage (and
+    raises ClaimLost when the claim or the lease is gone), and `.progress(unit, done, total)` reports a position. It
+    is called from the thread that does the work; the guard thread only reads `moved_at`. A new stage or a changed
+    position counts as moving; the same position reported again does not, so a loop that spins in place cannot keep
+    a job alive. Writing the position to the database never fails the job (it is a report), except that a write the
+    database refuses because the claim is gone means this worker must stop.
+    """
+
+    def __init__(self, repo, job, worker_id):
+        self.repo, self.job, self.worker_id = repo, job, worker_id
+        self.moved_at = time.monotonic()
+        self.stage = "PROCESSING"
+        self.position = None  # (unit, done, total) last reported in this stage
+
+    def __call__(self, status):
+        if not self.repo.set_stage(self.job["id"], self.worker_id, status):
+            raise ClaimLost(self.job["name"])
+        self.stage, self.position, self.moved_at = status, None, time.monotonic()
+
+    def progress(self, unit, done, total=None):
+        position = (unit, done, total)
+        if position == self.position:
+            return
+        self.position, self.moved_at = position, time.monotonic()
+        try:
+            recorded = self.repo.set_progress(self.job["id"], self.worker_id, unit, done, total)
+        except Exception:  # noqa: BLE001 - a database blip must not fail indexing; the position is only a report
+            log.warning("%s: could not record progress", self.job["name"], exc_info=True)
+            return
+        if not recorded:
+            raise ClaimLost(self.job["name"])
+
+    def describe(self):
+        """Where the job was when it last moved, for the error text of a stalled job."""
+        if self.position is None:
+            return self.stage
+        unit, done, total = self.position
+        return f"{self.stage}, {UNIT_TEXT.get(unit, unit)} {done}" + (f"/{total}" if total is not None else "")
+
+
+class JobGuard:
+    """While one document is processed: heartbeats, loss-of-claim detection and the time limits.
+
+    Two limits: the job fails when its progress has not moved for JOB_STALL_S (a big document may run for hours as long
+    as it keeps moving), and, as a safety net, when it has run for JOB_TIMEOUT_S in all. Heartbeats say "the process
+    is alive" and are independent of both: a worker that heartbeats but makes no progress is stuck.
+    """
+
+    def __init__(self, repo, job, worker_id, on_timeout, progress=None):
         self.repo, self.job, self.worker_id, self.on_timeout = repo, job, worker_id, on_timeout
+        self.progress = progress
         self.lost = False
         self.timed_out = False
         self._stop = threading.Event()
@@ -61,13 +115,41 @@ class JobGuard:
         self._stop.set()
         self._thread.join(timeout=5)
 
+    def _time_limit_error(self):
+        """The error text when a limit is exceeded, else None."""
+        now = time.monotonic()
+        if now - self._started > config.JOB_TIMEOUT_S:
+            return f"Vaqt tugadi ({config.JOB_TIMEOUT_S / 60:g} daqiqa: jami chegara)"
+        moved_at = self.progress.moved_at if self.progress else self._started
+        if now - moved_at > config.JOB_STALL_S:
+            where = f" ({self.progress.describe()})" if self.progress else ""
+            return f"Vaqt tugadi: {config.JOB_STALL_S / 60:g} daqiqa davomida hech qanday taraqqiyot bo'lmadi{where}"
+        return None
+
+    def _forgive_pause(self, elapsed):
+        """The guard wakes every JOB_HEARTBEAT_S. If much more time than that passed since its last look, the whole
+        process was frozen (the computer slept or hibernated), so nothing could move: that time is not a stall and
+        does not count against either limit. (The lease is not forgiven: a sleep longer than JOB_STALE_AFTER_S still
+        loses the claim, the heartbeat below says so, and the version is taken back and tried again.)"""
+        excess = elapsed - config.JOB_HEARTBEAT_S
+        if excess > max(2 * config.JOB_HEARTBEAT_S, 2.0):
+            self._started += excess
+            if self.progress:
+                self.progress.moved_at += excess
+            log.warning("%s: the process was paused for %.0f s (sleep?); that time is not counted", self.job["name"],
+                        excess)
+
     def _run(self):
+        last_look = time.monotonic()
         while not self._stop.wait(config.JOB_HEARTBEAT_S):
-            if time.monotonic() - self._started > config.JOB_TIMEOUT_S:
+            now = time.monotonic()
+            self._forgive_pause(now - last_look)
+            last_look = now
+            error = self._time_limit_error()
+            if error:
                 self.timed_out = True
-                limit = f"{config.JOB_TIMEOUT_S / 60:g} daqiqa"
-                log.error("%s exceeded the time limit (%s)", self.job["name"], limit)
-                self.repo.fail(self.job["id"], self.worker_id, f"Vaqt tugadi ({limit})", retry=False)
+                log.error("%s: %s", self.job["name"], error)
+                self.repo.fail(self.job["id"], self.worker_id, error, retry=False)
                 self.on_timeout()
                 return
             try:
@@ -113,8 +195,9 @@ class Worker:
         self.process(job)
         return True
 
-    def index(self, job):
+    def index(self, job, progress=None):
         """Parse, embed, index and verify one version; return its chunk count. Nothing here makes it active."""
+        progress = progress or JobProgress(self.repo, job, self.worker_id)
         path = storage.resolve(job["file_path"])
         if not path.exists():
             raise FileNotFoundError(f"fayl topilmadi: {job['name']}")
@@ -127,14 +210,10 @@ class Worker:
         elif actual_hash != file_hash:  # the stored file is not the one that was uploaded: never index it as such
             raise ValueError("Saqlangan fayl yuklangan fayldan farq qiladi (hash mos emas)")
 
-        def stage(status):
-            if not self.repo.set_stage(job["id"], self.worker_id, status):
-                raise ClaimLost(job["name"])
-
         count = ingest.index_version(self.client, self.converter, self.chunker, path, document_id=job["document_id"],
                                      version_id=job["id"], file_name=job["file_name"], file_hash=file_hash,
-                                     stage=stage)
-        stage("VERIFYING")
+                                     stage=progress)
+        progress("VERIFYING")
         versioning.verify(self.client, job["document_id"], job["id"], file_hash, count)
         if not self.repo.record_verified(job["id"], self.worker_id, count):
             raise ClaimLost(job["name"])
@@ -142,9 +221,10 @@ class Worker:
 
     def process(self, job):
         started = time.monotonic()
-        with JobGuard(self.repo, job, self.worker_id, self.on_timeout) as guard:
+        progress = JobProgress(self.repo, job, self.worker_id)
+        with JobGuard(self.repo, job, self.worker_id, self.on_timeout, progress) as guard:
             try:
-                count = self.index(job)
+                count = self.index(job, progress)
             except ClaimLost:
                 log.warning("%s: claim lost, another worker has taken over; stopping", job["name"])
                 outcome = ("lost", None, None)
