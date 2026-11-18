@@ -51,11 +51,13 @@ Faqat **alohida, bo'sh** muhitga. Uch maqsad ham majburiy, hech biri standart em
 
 ```powershell
 .\.venv\Scripts\python.exe -m rag restore D:\zaxira\rag-backup-20261113-094802 `
-    --database-url postgresql://rag:rag@127.0.0.1:15433/rag `
+    --database-url postgresql://<foydalanuvchi>:<parol>@127.0.0.1:15433/rag `
     --qdrant-url http://127.0.0.1:16333 `
     --storage D:\yangi-storage `
     --pg-container yangi-pg-konteyner
 ```
+
+Qattiqlashtirilgan (uch rolli) PostgreSQL ga tiklash: avval yangi serverda `db-setup --roles-only`, tiklashda `rag_migrator` URL, keyin `db-setup`; [postgres-hardening.md](postgres-hardening.md) "Zaxira va tiklash ta'siri". Zaxira rollarni va parollarni o'z ichiga olmaydi.
 
 Qadamlar: (1) zaxira SHA-256 bilan to'liq tekshiriladi; (2) maqsad bo'shligi tekshiriladi, aks holda **rad etiladi va hech narsaga tegilmaydi**: bazada jadval bo'lmasligi, Qdrant kolleksiyasi mavjud emasligi, storage papkasi bo'sh yoki yo'qligi; (3) `pg_restore` (`--single-transaction --exit-on-error`); (4) migratsiya tarixi manifest bilan solishtiriladi; (5) fayllar hash tekshiruvi bilan nusxalanadi; (6) Qdrant snapshoti yuklanadi va nuqtalar soni solishtiriladi; (7) maqsadda `reconcile` ishlaydi. Chiqish kodi: 0 hammasi toza, 1 rad etildi/xato, 2 tiklandi, lekin `reconcile` muammo ko'rsatdi.
 

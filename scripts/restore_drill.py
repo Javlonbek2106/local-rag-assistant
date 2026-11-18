@@ -1,6 +1,6 @@
 """Restore drill: prove, on a clean environment, that a backup brings the whole system back, and time it.
 
-    python scripts/restore_drill.py [--keep] [--json PATH]
+    python scripts/restore_drill.py [--hardened] [--keep] [--json PATH]
 
 Everything happens in throw-away Docker containers on free loopback ports and temp folders (tests/stack.py). The running
 system (the compose stack, its storage, its documents) is never read or written.
@@ -17,6 +17,10 @@ system (the compose stack, its storage, its documents) is never read or written.
   6. CHECK    the same sample questions as the integration tests: the right file on top and the fact in it, against the
               source baseline; two full answers through the API; version history, generation and a rollback on the
               restored system; the post-backup document is absent.
+With --hardened both stacks use the three PostgreSQL roles (docs/postgres-hardening.md): the source is set up and filled
+as rag_app, the backup is taken as rag_app, the target gets its OWN roles and passwords first (a backup carries
+neither), the restore runs as rag_migrator into the empty database, the runtime permissions are then put in place by
+db-setup, and the real application starts on the restored data as rag_app.
 RTO is measured from the start of the restore to the first successful search on the restored system. RPO is told from
 what the backup actually contains. Needs Docker, Ollama (bge-m3 and the answer model), Tesseract and the parsing models.
 """
@@ -35,7 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-from rag import answer, backup, config, db, ingest, llm, reconcile, store  # noqa: E402
+from rag import answer, backup, config, db, dbroles, ingest, llm, reconcile, store  # noqa: E402
 from rag.backup import PgTools  # noqa: E402
 from rag.target import Target  # noqa: E402
 from rag.worker import Worker  # noqa: E402
@@ -49,8 +53,10 @@ def log(message):
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
-def point_config_at(target):
+def point_config_at(target, hardened_port=None):
     """The in-process application code (db, store, worker) reads config; aim it at one environment."""
+    if hardened_port:
+        config.DB_HARDENED, config.DB_HOST, config.DB_PORT, config.DB_NAME = True, "127.0.0.1", hardened_port, "rag"
     config.DATABASE_URL, config.DB_SCHEMA = target.database_url, None
     config.QDRANT_URL, config.COLLECTION, config.STORAGE_DIR = target.qdrant_url, target.collection, target.storage_dir
     db.close()
@@ -103,6 +109,7 @@ def stop_process(process):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--hardened", action="store_true", help="use the three PostgreSQL roles on both stacks")
     parser.add_argument("--keep", action="store_true", help="keep the containers and folders for inspection")
     parser.add_argument("--json", type=Path, help="also write the summary to this file")
     args = parser.parse_args()
@@ -124,7 +131,14 @@ def main():
 
         # ---------- 1. the source system, built by the real pipeline ----------
         source = Target(source_stack.database_url, source_stack.qdrant_url, COLLECTION, work / "source-storage")
-        point_config_at(source)
+        port = source_stack.pg_port if args.hardened else None
+        if args.hardened:
+            config.SECRETS_DIR, config.SECURITY_LOG_DIR = work / "secrets-source", work / "security-log"
+            point_config_at(source, port)
+            dbroles.ensure_secrets()
+            dbroles.setup(source_stack.pg_container, adopt_legacy=True)
+            source = Target(db.runtime_url(), source_stack.qdrant_url, COLLECTION, work / "source-storage")
+        point_config_at(source, port)
         db.migrate()
         store.ensure_collection(store.get_client(), lambda: len(llm.embed(["probe"])[0]))
         samples = make_samples(work / "samples")
@@ -177,9 +191,23 @@ def main():
 
         # ---------- 4. restore into the second, empty stack ----------
         target = Target(target_stack.database_url, target_stack.qdrant_url, COLLECTION, work / "restored-storage")
+        if args.hardened:
+            db.close()
+            config.SECRETS_DIR = work / "secrets-target"  # the target's OWN passwords: a backup carries none
+            point_config_at(target, target_stack.pg_port)
+            dbroles.ensure_secrets()
+            dbroles.setup(target_stack.pg_container, adopt_legacy=True, migrate=False)  # roles first, no tables yet
+            target = Target(dbroles.url_with_password(dbroles.MIGRATOR), target_stack.qdrant_url, COLLECTION,
+                            work / "restored-storage")
         t_restore = time.time()
         log("restoring into the empty target stack")
         restored = backup.restore(folder, target, PgTools(container=target_stack.pg_container))
+        if args.hardened:  # the restored tables get their owner and rag_app its permissions
+            dbroles.setup(target_stack.pg_container)
+            checked = dict(dbroles.verify())
+            checked.pop("bootstrap_closed_over_network")  # the drill's server has the image's default pg_hba.conf
+            summary["hardened_checks_after_restore"] = checked
+            target = Target(db.runtime_url(), target_stack.qdrant_url, COLLECTION, work / "restored-storage")
         summary["restore"] = {**restored, "reconcile_clean": restored["ok"]}
         log(f"restore {restored['seconds']['total']} s, reconcile {restored['reconcile']}")
 
@@ -188,6 +216,11 @@ def main():
         env = {**os.environ, "RAG_DATABASE_URL": target.database_url, "RAG_QDRANT_URL": target.qdrant_url,
                "RAG_STORAGE": str(target.storage_dir), "RAG_COLLECTION": COLLECTION, "RAG_PORT": str(port),
                "PYTHONIOENCODING": "utf-8"}
+        if args.hardened:  # the application connects as rag_app with the password from the file, not from a URL
+            env.pop("RAG_DATABASE_URL")
+            env.update({"RAG_DB_HARDENED": "1", "RAG_DB_HOST": "127.0.0.1", "RAG_DB_PORT": str(target_stack.pg_port),
+                        "RAG_DB_NAME": "rag", "RAG_SECRETS_DIR": str(config.SECRETS_DIR),
+                        "RAG_SECURITY_LOG_DIR": str(config.SECURITY_LOG_DIR)})
         t_app = time.time()
         api = subprocess.Popen([sys.executable, "-m", "rag", "api"], env=env, cwd=ROOT, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
@@ -205,7 +238,7 @@ def main():
         summary["app_ready_seconds"] = round(time.time() - t_app, 1)
 
         # ---------- 6. the first search on the restored system, and the checks ----------
-        point_config_at(target)
+        point_config_at(target, target_stack.pg_port if args.hardened else None)
         t_search = time.time()
         after = search_results()
         summary["first_search_seconds"] = round(time.time() - t_search, 2)
@@ -237,6 +270,9 @@ def main():
         ok = (summary["backup"]["valid"] and summary["restore"]["reconcile_clean"]
               and summary["restored_matches_baseline"] and summary["post_backup_document_absent_after_restore"]
               and summary["final_reconcile_exit_code"] == 0)
+        if args.hardened:
+            ok = ok and all(summary["hardened_checks_after_restore"].values())
+            summary["hardened"] = True
         summary["drill_passed"] = ok
         text = json.dumps(summary, indent=2, ensure_ascii=False, default=str)
         print(text)

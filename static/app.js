@@ -555,4 +555,148 @@ $("question").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("ask-form").requestSubmit(); }
 });
 
+// ---------- connector sign-in (roadmap M4.1a, ADR-P16) ----------
+// Only the connector's own requests (/api/v1/...) carry the session token. It lives in sessionStorage (this tab only, gone
+// when the tab is closed): never in localStorage, a cookie or the address. The document and ask requests above never see
+// it. When the application runs with the connector off, /api/v1/session does not exist (404) and this section stays hidden.
+const SESSION_KEY = "rag.session";
+let sessionTimer = null;
+let connectorEnabled = null; // learned once from GET /api/v1/connector, which always answers 200
+
+function storedToken() {
+  try { return sessionStorage.getItem(SESSION_KEY); } catch { return null; }
+}
+
+function storeToken(token) {
+  try {
+    if (token) sessionStorage.setItem(SESSION_KEY, token); else sessionStorage.removeItem(SESSION_KEY);
+  } catch { /* storage unavailable: the user will have to pair again */ }
+}
+
+function connectorFetch(path, options = {}) {
+  if (!path.startsWith("/api/v1/")) throw new Error("the session token is only for /api/v1");
+  const headers = { ...(options.headers || {}) };
+  const token = storedToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return fetch(path, { ...options, headers });
+}
+
+function connectorMessage(text) {
+  const box = $("connector-msg");
+  box.hidden = !text;
+  setText(box, text || "");
+}
+
+// mode: "hidden" | "pair" | "session" | "unavailable"
+function showConnector(mode, info) {
+  $("connector-auth").hidden = mode === "hidden";
+  $("pair-box").hidden = mode !== "pair";
+  $("session-box").hidden = mode !== "session";
+  const states = {
+    unavailable: "Ulagich hozir ishlamayapti (xavfsizlik shartlari bajarilmagan). Ilova oynasidagi xabarga qarang.",
+    pair: "Ulagichdan foydalanish uchun kod bilan kiring.",
+    session: "Ulagichga kirilgan.",
+  };
+  setText($("connector-state"), states[mode] || "");
+  if (mode === "session") setText($("session-info"), `Sessiya: ${Math.ceil(info.absolute_remaining_s / 60)} daqiqa qoldi`);
+}
+
+// Asking where the session stands does not keep it alive: the server counts it as a look, not a use.
+async function refreshSession() {
+  clearTimeout(sessionTimer);
+  let delay = 15000;
+  try {
+    if (connectorEnabled === null) {
+      const found = await fetch("/api/v1/connector"); // public; says only whether the connector is on
+      connectorEnabled = found.ok && (await found.json()).enabled === true;
+    }
+    if (!connectorEnabled) {
+      showConnector("hidden"); // off: nothing to show, nothing to poll
+      return;
+    }
+    const hadToken = Boolean(storedToken());
+    const res = await connectorFetch("/api/v1/session");
+    if (res.status === 200) {
+      showConnector("session", await res.json());
+    } else if (res.status === 401) {
+      storeToken(null);
+      showConnector("pair");
+      if (hadToken) {
+        connectorMessage("Sessiya tugadi. Qayta kod bilan kiring.");
+        announce("Sessiya tugadi. Qayta kod bilan kiring.");
+      }
+    } else if (res.status === 503) {
+      showConnector("unavailable");
+    } else {
+      showConnector("hidden"); // anything else: nothing usable here
+      return;
+    }
+  } catch {
+    delay = 30000; // no answer: keep what is shown and ask again later
+  }
+  sessionTimer = setTimeout(refreshSession, delay);
+}
+
+$("pair-request").addEventListener("click", async () => {
+  connectorMessage("");
+  try {
+    const res = await connectorFetch("/api/v1/session/pairing", { method: "POST" });
+    if (res.status === 200) {
+      announce("Kod ilova oynasida ko'rsatildi.");
+      $("pair-code").focus();
+    } else if (res.status === 429) {
+      connectorMessage("Juda tez. Bir necha soniyadan keyin qayta so'rang.");
+    } else if (res.status === 503) {
+      showConnector("unavailable");
+    } else {
+      connectorMessage("Kod so'rab bo'lmadi.");
+    }
+  } catch {
+    connectorMessage("Server bilan aloqa yo'q.");
+  }
+});
+
+$("pair-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const code = $("pair-code").value.trim();
+  $("pair-code").value = ""; // the code is never kept, whatever the answer
+  if (!code) return;
+  connectorMessage("");
+  try {
+    const res = await connectorFetch("/api/v1/session/exchange", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    if (res.status === 200) {
+      storeToken((await res.json()).token);
+      announce("Ulagichga kirildi.");
+      await refreshSession();
+      if (!$("session-box").hidden) $("session-end").focus();
+    } else if (res.status === 401) {
+      connectorMessage("Kod noto'g'ri yoki eskirgan. Yangi kod so'rang.");
+    } else if (res.status === 429) {
+      connectorMessage("Juda ko'p urinish. Biroz kutib, yangi kod so'rang.");
+    } else if (res.status === 503) {
+      showConnector("unavailable");
+    } else {
+      connectorMessage("Kirib bo'lmadi.");
+    }
+  } catch {
+    connectorMessage("Server bilan aloqa yo'q.");
+  }
+});
+
+$("session-end").addEventListener("click", async () => {
+  try {
+    await connectorFetch("/api/v1/session", { method: "DELETE" });
+  } catch { /* the server forgets the session at the latest when it expires */ }
+  storeToken(null);
+  connectorMessage("");
+  announce("Sessiya tugatildi.");
+  await refreshSession();
+  if (!$("pair-box").hidden) $("pair-request").focus();
+});
+
 refreshDocs();
+refreshSession();

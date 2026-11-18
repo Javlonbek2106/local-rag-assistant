@@ -329,17 +329,20 @@ def test_the_migration_adds_columns_and_changes_nothing_that_was_there():
             before = conn.execute(f"SELECT {old_columns} FROM document_versions ORDER BY id").fetchall()
             documents_before = conn.execute("SELECT * FROM documents ORDER BY id").fetchall()
             existing = {r["column_name"] for r in conn.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s", (schema,))}
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name IN ('documents', 'document_versions')", (schema,))}
 
-        db.migrate()  # applies 0004 and nothing else
+        db.migrate()  # applies 0004, and every migration written after it (what this test is about is 0004)
 
         with db.pool().connection() as conn:
             applied = [r["version"] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
-            assert applied[-1] == "0004_job_progress" and len(applied) == 4
+            assert applied[:4] == ["0001_documents", "0002_document_versions", "0003_rollback_generation",
+                                   "0004_job_progress"] and "0004_job_progress" in applied
             assert conn.execute(f"SELECT {old_columns} FROM document_versions ORDER BY id").fetchall() == before
             assert conn.execute("SELECT * FROM documents ORDER BY id").fetchall() == documents_before
             now = {r["column_name"] for r in conn.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s", (schema,))}
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name IN ('documents', 'document_versions')", (schema,))}
             assert now - existing == {"progress_unit", "progress_done", "progress_total", "progress_at"}
             assert existing <= now  # nothing was removed or renamed
             assert conn.execute("SELECT count(*) AS n FROM document_versions WHERE progress_unit IS NOT NULL OR "

@@ -73,9 +73,13 @@ def dependencies(repo):
         return {"postgres": postgres.result(), "qdrant": qdrant.result(), "ollama": ollama.result()}
 
 
-def readiness(repo):
+def readiness(repo, connector=None):
+    """`connector` is given only when the connector is enabled: a function that says "ok" or "unavailable". Without it
+    the answer is exactly what it always was. With it, an unavailable connector means not ready (fail closed)."""
     checks = dependencies(repo)
-    if checks["postgres"] != "ok" or checks["qdrant"] != "ok":
+    if connector is not None:
+        checks["connector"] = connector()
+    if checks["postgres"] != "ok" or checks["qdrant"] != "ok" or checks.get("connector", "ok") != "ok":
         status = "not_ready"
     elif checks["ollama"] != "ok":
         status = "degraded"
@@ -99,9 +103,12 @@ def _in_flight(item):
     return item
 
 
-def status_report(repo):
-    """The compact status. If PostgreSQL itself is down the numbers are missing, the dependency checks still answer."""
+def status_report(repo, connector=None):
+    """The compact status. If PostgreSQL itself is down the numbers are missing, the dependency checks still answer.
+    `connector` is given only when the connector is enabled (see `readiness`)."""
     checks = dependencies(repo)
+    if connector is not None:
+        checks["connector"] = connector()
     snapshot = None
     if checks["postgres"] == "ok":
         try:
@@ -111,7 +118,7 @@ def status_report(repo):
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "ready": "not_ready" if checks["postgres"] != "ok" or checks["qdrant"] != "ok"
-        else ("ready" if checks["ollama"] == "ok" else "degraded"),
+        or checks.get("connector", "ok") != "ok" else ("ready" if checks["ollama"] == "ok" else "degraded"),
         "dependencies": checks,
         "documents": None, "versions": None, "queue": None, "last_errors": None,
         "reconcile": reconcile.load_last(),

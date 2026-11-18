@@ -8,6 +8,7 @@ Operations (each prints its own --help):
     python -m rag reconcile  read-only check of PostgreSQL, Qdrant and the stored files against each other
     python -m rag backup     PostgreSQL + storage + Qdrant snapshot into one verified backup folder
     python -m rag restore    restore a backup into an EMPTY, separate environment
+    python -m rag db-secrets | db-setup | db-rotate | db-check    hardened PostgreSQL roles (docs/postgres-hardening.md)
 """
 import importlib
 import logging
@@ -25,7 +26,9 @@ def serve():
 
 
 OPERATIONS = {"reconcile": ("rag.reconcile", "main"), "backup": ("rag.backup", "main"),
-              "restore": ("rag.backup", "restore_main")}
+              "restore": ("rag.backup", "restore_main"), "db-secrets": ("rag.dbadmin", "secrets_main"),
+              "db-setup": ("rag.dbadmin", "setup_main"), "db-rotate": ("rag.dbadmin", "rotate_main"),
+              "db-check": ("rag.dbadmin", "check_main")}
 
 
 def main(argv):

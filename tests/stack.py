@@ -27,7 +27,8 @@ def free_port():
 class Stack:
     PG_IMAGE, QDRANT_IMAGE = "postgres:17-alpine", "qdrant/qdrant:v1.20.0"
 
-    def __init__(self, label="t"):
+    def __init__(self, label="t", with_qdrant=True):
+        self.with_qdrant = with_qdrant
         suffix = uuid.uuid4().hex[:8]
         self.pg_container, self.qdrant_container = f"ragtest-{label}-pg-{suffix}", f"ragtest-{label}-qd-{suffix}"
         self.pg_port, self.qdrant_port = free_port(), free_port()
@@ -53,11 +54,12 @@ class Stack:
         self._run("run", "-d", "--rm", "--name", self.pg_container, "-e", "POSTGRES_USER=rag", "-e",
                   "POSTGRES_PASSWORD=rag", "-e", "POSTGRES_DB=rag", "-p", f"127.0.0.1:{self.pg_port}:5432",
                   self.PG_IMAGE)
-        self._run("run", "-d", "--rm", "--name", self.qdrant_container, "-e", "QDRANT__TELEMETRY_DISABLED=true", "-p",
-                  f"127.0.0.1:{self.qdrant_port}:6333", self.QDRANT_IMAGE)
+        if self.with_qdrant:
+            self._run("run", "-d", "--rm", "--name", self.qdrant_container, "-e", "QDRANT__TELEMETRY_DISABLED=true",
+                      "-p", f"127.0.0.1:{self.qdrant_port}:6333", self.QDRANT_IMAGE)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._pg_ready() and self._qdrant_ready():
+            if self._pg_ready() and (self._qdrant_ready() or not self.with_qdrant):
                 return self
             time.sleep(1)
         self.stop()

@@ -105,7 +105,7 @@ static/         sahifa
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest                       # unit testlar: xizmatlar kerak emas, bir necha soniya
-$env:RAG_TEST_DATABASE_URL = "postgresql://rag:rag@127.0.0.1:5433/rag"            # + PostgreSQL testlari (docker compose up -d postgres)
+$env:RAG_TEST_DATABASE_URL = "postgresql://postgres:<parol>@127.0.0.1:55433/postgres"   # + PostgreSQL testlari: alohida vaqtincha server (docs/postgres-hardening.md)
 $env:RAG_INTEGRATION = "1"; .\.venv\Scripts\python.exe -m pytest tests/integration   # haqiqiy Qdrant + Ollama + Tesseract
 $env:RAG_E2E = "1"; .\.venv\Scripts\python.exe -m pytest tests/e2e                   # brauzerda (Edge) butun oqim
 .\.venv\Scripts\python.exe -m ruff check .
@@ -113,6 +113,8 @@ $env:RAG_E2E = "1"; .\.venv\Scripts\python.exe -m pytest tests/e2e              
 
 CI (GitHub Actions) unit testlar, PostgreSQL testlari va lint ni ishga tushiradi; qolganlariga modellar kerak.
 Testlar PostgreSQL'da vaqtinchalik sxema yaratadi va tugagach o'chiradi, sizning ma'lumotlaringizga tegmaydi.
+
+Qattiqlashtirilgan bazada (`docs/postgres-hardening.md`) superuser tarmoqdan kirmaydi, shuning uchun PostgreSQL testlari uchun alohida vaqtincha server ishlating (o'sha hujjatning oxirgi bandi). `tests/integration/test_pg_hardening.py` o'zining vaqtincha Docker serverini o'zi ko'taradi.
 
 ## Sifatni o'lchash
 

@@ -141,8 +141,8 @@ def test_a_backup_is_a_complete_verified_folder_with_a_full_manifest(source, tmp
     assert manifest["storage"]["file_count"] == 4 and len(manifest["storage"]["files"]) == 4
     assert manifest["qdrant"]["collection"] == SOURCE_COLLECTION and manifest["qdrant"]["points_count"] == 7
     assert manifest["qdrant"]["vector_size"] == DIM and manifest["qdrant"]["distance"] == "Cosine"
-    assert manifest["postgres"]["migrations"] == ["0001_documents", "0002_document_versions",
-                                                  "0003_rollback_generation", "0004_job_progress"]
+    # every migration the code has, in order (the list grows with each new migration file)
+    assert manifest["postgres"]["migrations"] == sorted(p.stem for p in db.MIGRATIONS.glob("*.sql"))
     assert manifest["postgres"]["server_version"].startswith("17")
     assert backup.verify(folder) == []
     assert not (folder / ".manifest.json.tmp").exists()

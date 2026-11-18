@@ -16,10 +16,11 @@ import logging
 import uuid
 from pathlib import Path
 
+import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from rag import config, storage
+from rag import config, dbroles, storage
 
 log = logging.getLogger(__name__)
 MIGRATIONS = Path(__file__).parent / "migrations"
@@ -63,38 +64,98 @@ class VersionConflict(Exception):
     """The requested change of the active version is not allowed in the version's current state."""
 
 
+class _RuntimeConnection(psycopg.Connection):
+    """A connection of the hardened runtime pool: the password is read from its secret file each time a connection is
+    made, never held in the pool's settings, so a rotated password is used by the next connection with no restart."""
+
+    @classmethod
+    def connect(cls, conninfo="", **kwargs):
+        return super().connect(conninfo, password=dbroles.read_password(dbroles.APP), **kwargs)
+
+
 @functools.lru_cache(maxsize=1)
 def pool():
     kwargs = {"row_factory": dict_row, "autocommit": True}
     if config.DB_SCHEMA:
         kwargs["options"] = f"-c search_path={config.DB_SCHEMA}"
+    if config.DB_HARDENED:  # the application's own role, rag_app; a missing or unsafe secret stops here, clearly
+        dbroles.read_password(dbroles.APP)
+        return ConnectionPool(dbroles.conninfo(dbroles.APP), connection_class=_RuntimeConnection, min_size=1,
+                              max_size=config.DB_POOL_SIZE, kwargs=kwargs, open=True)
     return ConnectionPool(config.DATABASE_URL, min_size=1, max_size=config.DB_POOL_SIZE, kwargs=kwargs, open=True)
 
 
 def close():
-    pool().close()
+    if pool.cache_info().currsize:  # never open a pool only to close it (the hardened one needs a secret to open)
+        pool().close()
     pool.cache_clear()
 
 
-def migrate():
-    """Apply every migrations/*.sql that has not been applied yet. Safe to call from several processes."""
-    with pool().connection() as conn:
-        conn.execute("SELECT pg_advisory_lock(%s)", (MIGRATION_LOCK,))
-        try:
-            conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
-                         "(version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
+def runtime_url():
+    """The URL of the database as the application sees it (for the backup tools); in hardened mode it includes the
+    password of rag_app, in memory only."""
+    return dbroles.url_with_password(dbroles.APP) if config.DB_HARDENED else config.DATABASE_URL
+
+
+def _migrator_connection():
+    """A short-lived connection as rag_migrator: the only role that may change the schema. Hardened mode only."""
+    kwargs = {"row_factory": dict_row, "autocommit": True, "connect_timeout": 10,
+              "password": dbroles.read_password(dbroles.MIGRATOR)}
+    if config.DB_SCHEMA:
+        kwargs["options"] = f"-c search_path={config.DB_SCHEMA}"
+    return psycopg.connect(dbroles.conninfo(dbroles.MIGRATOR), **kwargs)
+
+
+def _apply_pending(conn):
+    """Apply every migrations/*.sql not yet applied, serialised by an advisory lock, on `conn`."""
+    conn.execute("SELECT pg_advisory_lock(%s)", (MIGRATION_LOCK,))
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
+                     "(version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
+        done = {row["version"] for row in conn.execute("SELECT version FROM schema_migrations")}
+        for path in sorted(MIGRATIONS.glob("*.sql")):
+            if path.stem in done:
+                continue
+            with conn.transaction():
+                conn.execute(path.read_text(encoding="utf-8"))
+                conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (path.stem,))
+            log.info("applied migration %s", path.stem)
+        if config.DB_HARDENED:  # still under the lock: nobody reads a half-granted state as "current"
+            dbroles.apply_runtime_grants(conn, config.DB_SCHEMA or "public")
+    finally:
+        conn.execute("SELECT pg_advisory_unlock(%s)", (MIGRATION_LOCK,))
+
+
+def _is_current():
+    """Hardened mode: asked by the runtime role itself. True when every migration is recorded and rag_app already has
+    exactly its permissions; any doubt (no table yet, no right to read it, no connection) is False."""
+    try:
+        with pool().connection(timeout=config.SECURITY_DB_TIMEOUT_S) as conn:
             done = {row["version"] for row in conn.execute("SELECT version FROM schema_migrations")}
-            for path in sorted(MIGRATIONS.glob("*.sql")):
-                if path.stem in done:
-                    continue
-                with conn.transaction():
-                    conn.execute(path.read_text(encoding="utf-8"))
-                    conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (path.stem,))
-                log.info("applied migration %s", path.stem)
-        finally:
-            conn.execute("SELECT pg_advisory_unlock(%s)", (MIGRATION_LOCK,))
+            if {path.stem for path in MIGRATIONS.glob("*.sql")} - done:
+                return False
+            return dbroles.grants_in_place(conn, config.DB_SCHEMA or "public")
+    except psycopg.Error:
+        return False
 
 
+def migrate():
+    """Apply every migrations/*.sql that has not been applied yet. Safe to call from several processes.
+
+    Single-role mode (default): the one role does it, as before. Hardened mode: the runtime role rag_app only LOOKS; if
+    something is pending, rag_migrator (the only role with DDL rights) connects, takes the advisory lock, applies it,
+    refreshes rag_app's permissions and disconnects. The API, the worker and the CLI may all call this at once: the lock
+    makes the first one do the work and the others find it done. If the migrator's secret is missing the call fails; it
+    never falls back to another role.
+    """
+    if not config.DB_HARDENED:
+        with pool().connection() as conn:
+            _apply_pending(conn)
+        return
+    if _is_current():
+        return
+    with _migrator_connection() as conn:
+        _apply_pending(conn)
 
 
 # ---------- documents and versions ----------

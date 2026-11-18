@@ -28,6 +28,9 @@ aside, .chat { background: var(--panel); border: 1px solid var(--line); border-r
 .drop:hover, .drop.over, .drop:focus-visible { border-color: var(--accent); }
 .upload-msg { margin-top: 8px; font-size: 13px; color: var(--warn); }
 .upload-status { margin-top: 8px; font-size: 13px; overflow-wrap: anywhere; }
+.connector-auth { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.pair-form { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.pair-form input { font: inherit; letter-spacing: .15em; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
 .upload-bar { margin-top: 4px; }
 .docs { list-style: none; margin: 12px 0 0; padding: 0; overflow: auto; flex: 1; }
 .docs li { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 8px 0; border-bottom: 1px solid var(--line); align-items: center; }

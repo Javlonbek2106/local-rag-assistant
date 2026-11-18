@@ -292,14 +292,25 @@ def client(storage_dir, repo, qdrant):
 
 @pytest.fixture(scope="session")
 def database():
-    """A throw-away schema in the test database, migrated once and dropped at the end."""
+    """A throw-away schema in the test database, migrated once and dropped at the end.
+
+    With RAG_TEST_HARDENED=1 the server already has the three roles (docs/postgres-hardening.md), RAG_SECRETS_DIR points
+    at their passwords and RAG_TEST_DATABASE_URL is a superuser that may log in (e.g. rag_bootstrap on a server without
+    the compose pg_hba.conf): the schema then belongs to rag_migrator and the suite runs through the pool of rag_app."""
     url = os.environ["RAG_TEST_DATABASE_URL"]
     schema = f"rag_test_{uuid.uuid4().hex[:8]}"
+    hardened = os.getenv("RAG_TEST_HARDENED") == "1"
     with psycopg.connect(url, autocommit=True) as conn:
-        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"CREATE SCHEMA {schema}" + (" AUTHORIZATION rag_migrator" if hardened else ""))
     mp = pytest.MonkeyPatch()
     mp.setattr(config, "DATABASE_URL", url)
     mp.setattr(config, "DB_SCHEMA", schema)
+    if hardened:
+        parts = psycopg.conninfo.conninfo_to_dict(url)
+        mp.setattr(config, "DB_HARDENED", True)
+        mp.setattr(config, "DB_HOST", parts["host"])
+        mp.setattr(config, "DB_PORT", int(parts["port"]))
+        mp.setattr(config, "DB_NAME", parts["dbname"])
     db.pool.cache_clear()
     db.migrate()
     yield schema

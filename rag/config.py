@@ -17,6 +17,13 @@ COLLECTION = os.getenv("RAG_COLLECTION", "documents_v2")
 DATABASE_URL = os.getenv("RAG_DATABASE_URL", "postgresql://rag:rag@127.0.0.1:5433/rag")
 DB_SCHEMA = os.getenv("RAG_DB_SCHEMA")  # tests only: isolates a run in its own schema
 DB_POOL_SIZE = int(os.getenv("RAG_DB_POOL_SIZE", "5"))
+# Hardened PostgreSQL (roadmap M4.1a, step 7, docs/postgres-hardening.md): the application connects as three different
+# roles (runtime / migrations / bootstrap), each with its own password kept in a private secret file, never in a URL.
+# Off: the single-role mode above, unchanged (RAG_DATABASE_URL). The connector refuses to run unless it is on.
+DB_HARDENED = os.getenv("RAG_DB_HARDENED", "").lower() in ("1", "true")
+DB_HOST = os.getenv("RAG_DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("RAG_DB_PORT", "5433"))
+DB_NAME = os.getenv("RAG_DB_NAME", "rag")
 
 # Indexing jobs
 JOB_MAX_ATTEMPTS = int(os.getenv("RAG_JOB_MAX_ATTEMPTS", "3"))
@@ -95,3 +102,39 @@ OCR_LANGS = ["uzb", "uzb_cyrl", "rus", "eng"]
 HOST = "127.0.0.1"
 PORT = int(os.getenv("RAG_PORT", "8765"))
 STATIC_DIR = ROOT / "static"
+
+
+# Connector security foundation (roadmap M4.1a, ADR-P16). Everything below is inert while CONNECTOR_ENABLED is false:
+# no route is added and no check runs, so the existing application behaves exactly as before (decision D-15).
+CONNECTOR_ENABLED = os.getenv("RAG_CONNECTOR_ENABLED", "0").strip().lower() in ("1", "true")
+
+
+def _default_state_dir():
+    """Where the connector keeps its secrets and the security log: outside the project, in the user's own profile."""
+    if os.name == "nt":
+        base = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.getenv("XDG_STATE_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "local-rag-assistant"
+
+
+STATE_DIR = Path(os.getenv("RAG_STATE_DIR") or _default_state_dir())
+SECRETS_DIR = Path(os.getenv("RAG_SECRETS_DIR") or STATE_DIR / "secrets")
+SECURITY_LOG_DIR = Path(os.getenv("RAG_SECURITY_LOG_DIR") or STATE_DIR / "logs" / "security")
+# Accepted values (D-4), in seconds. Deliberately not environment settings: a longer session must be a decision.
+SESSION_ABSOLUTE_S = 12 * 60  # a session ends this long after it was made, whatever happens
+SESSION_IDLE_S = 2 * 60  # ... or after this long without a request that needs it
+STEP_UP_S = 10 * 60  # a step-up confirmation counts this long, never past the end of the session
+SESSION_MAX_COUNT = 5  # sessions alive at once; the oldest is ended when a sixth is made
+# One-time pairing code (D-3). The numbers are implementation parameters proposed in the M4.1a plan, to be confirmed.
+PAIRING_DIGITS = 8
+PAIRING_TTL_S = 60
+PAIRING_REQUEST_GAP_S = 10  # a new code cannot be asked for sooner than this after the previous request
+PAIRING_ATTEMPTS = 5  # exchange attempts allowed per PAIRING_WINDOW_S; the next one starts a lockout
+PAIRING_WINDOW_S = 60
+PAIRING_LOCKOUT_S = 30
+# Security event log (D-14): rotated by size. Retention is by file count here; a time limit is still an open decision.
+SECURITY_LOG_MAX_BYTES = 5 * 1024 * 1024
+SECURITY_LOG_BACKUPS = 5
+SECURITY_CHECK_TTL_S = 60  # how long the result of the security checks is reused
+SECURITY_DB_TIMEOUT_S = 5  # how long a security check waits for the database (the pool's own wait is 30 s)

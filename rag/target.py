@@ -12,7 +12,7 @@ import psycopg
 from psycopg.rows import dict_row
 from qdrant_client import QdrantClient
 
-from rag import config
+from rag import config, db
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class Target:
 
     @classmethod
     def from_config(cls):
-        return cls(config.DATABASE_URL, config.QDRANT_URL, config.COLLECTION, config.STORAGE_DIR, config.DB_SCHEMA)
+        return cls(db.runtime_url(), config.QDRANT_URL, config.COLLECTION, config.STORAGE_DIR, config.DB_SCHEMA)
 
     def connect(self, **kwargs):
         """A new PostgreSQL connection (rows as dicts). The caller closes it."""

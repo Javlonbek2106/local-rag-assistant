@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
   <title>Hujjatlar yordamchisi</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/app.css">
@@ -26,6 +27,24 @@
       <div id="upload-msg" class="upload-msg" role="alert" hidden></div>
       <ul id="docs" class="docs" aria-label="Hujjatlar ro'yxati"></ul>
       <p id="docs-empty" class="muted" hidden>Hozircha hujjat yo'q.</p>
+      <section id="connector-auth" class="connector-auth" aria-label="Ulagich kirishi" hidden>
+        <h2>Ulagich</h2>
+        <p id="connector-state" class="muted" role="status"></p>
+        <div id="pair-box" hidden>
+          <button id="pair-request" type="button">Kod so'rash</button>
+          <p class="muted">Kod ilova oynasida (start.bat) ko'rinadi.</p>
+          <form id="pair-form" class="pair-form">
+            <label for="pair-code" class="muted">8 xonali kod</label>
+            <input id="pair-code" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="9" data-focus-key="pair-code">
+            <button id="pair-send" type="submit">Kirish</button>
+          </form>
+        </div>
+        <div id="session-box" hidden>
+          <p id="session-info" class="muted"></p>
+          <button id="session-end" type="button">Chiqish</button>
+        </div>
+        <div id="connector-msg" class="upload-msg" role="alert" hidden></div>
+      </section>
     </aside>
     <section class="chat" aria-label="Savol-javob">
       <h2>Savol-javob</h2>

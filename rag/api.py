@@ -13,6 +13,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from rag import answer, config, db, health, ingest, llm, storage, store, versioning
+from rag.auth.deps import build_context as build_security
+from rag.auth.routes import install as install_auth
+from rag.auth.routes import install_discovery
 from rag.bodylimit import UploadBodyLimit
 from rag.relay import Relay
 
@@ -87,14 +90,20 @@ def stale(version):
     return unfinished and version["uploaded_generation"] < version["activation_generation"]
 
 
-def create_app(repo=db):
-    """`repo` is the document/queue repository (rag.db); tests pass an in-memory fake."""
+def create_app(repo=db, security=None):
+    """`repo` is the document/queue repository (rag.db); tests pass an in-memory fake. `security` is the authentication
+    layer of the connector (rag.auth): built here from the settings when the connector is enabled, passed in by tests;
+    without it the application is exactly as it was before the connector (ADR-007, decisions D-1 and D-15)."""
+    if security is None and config.CONNECTOR_ENABLED:
+        security = build_security()
     allowed_hosts = {f"127.0.0.1:{config.PORT}", f"localhost:{config.PORT}"}
     allowed_origins = {f"http://{h}" for h in allowed_hosts}
 
     @asynccontextmanager
     async def lifespan(_app):
         repo.migrate()
+        if security:
+            security.startup()  # never raises: a failed security condition makes the connector unavailable, no more
         storage.temp_dir().mkdir(parents=True, exist_ok=True)
         for leftover in storage.temp_dir().iterdir():  # uploads interrupted by a crash
             leftover.unlink(missing_ok=True)
@@ -108,6 +117,10 @@ def create_app(repo=db):
         yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    if security:
+        install_auth(app, security)  # the connector's own routes, under /api/v1; no existing route is touched
+    else:
+        install_discovery(app)  # the one route that says the connector is off
     # Added before `guard`, so it sits inside it: the Host/Origin checks answer first, then the body is limited.
     app.add_middleware(UploadBodyLimit)
 
@@ -138,13 +151,13 @@ def create_app(repo=db):
     @app.get("/readyz")
     def readyz():
         """Readiness: PostgreSQL and Qdrant answer (503 otherwise); without Ollama the answer is "degraded"."""
-        result = health.readiness(repo)
+        result = health.readiness(repo, connector=security.readiness_word if security else None)
         return JSONResponse(result, status_code=503 if result["status"] == "not_ready" else 200)
 
     @app.get("/api/status")
     def status():
         """A compact summary: counts, queue age, what is being indexed, last errors, dependencies, last reconcile."""
-        return health.status_report(repo)
+        return health.status_report(repo, connector=security.readiness_word if security else None)
 
     @app.get("/api/documents")
     def documents():
