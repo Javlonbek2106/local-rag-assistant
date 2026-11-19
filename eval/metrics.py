@@ -1,20 +1,32 @@
 """Pure functions for scoring retrieval and answers. No services needed, so they are unit-tested."""
+import re
 import statistics
 
 from rag.answer import cited_indices
 
 APOSTROPHES = str.maketrans({"ʻ": "'", "ʼ": "'", "’": "'", "‘": "'", "`": "'", "´": "'"})
+# "184,772,665" and "40 090" are the same number as "184772665" and "40090": a separator followed by exactly three
+# digits is a thousands separator ("7,3" is a decimal comma and is left alone).
+THOUSANDS = re.compile(r"(?<=\d)[ , ](?=\d{3}(?!\d))")
 
 
 def normalize(text):
-    """Case, apostrophe and whitespace differences must not count as a wrong answer."""
-    return " ".join(text.translate(APOSTROPHES).casefold().split())
+    """Case, apostrophe, whitespace and thousands-separator differences must not count as a wrong answer."""
+    collapsed = " ".join(text.translate(APOSTROPHES).casefold().split())
+    return THOUSANDS.sub("", collapsed)
 
 
 def contains_facts(text, facts):
-    """True when every fact appears in the text (after normalisation). No facts means nothing to check."""
+    """True when every fact appears in the text (after normalisation). No facts means nothing to check.
+
+    A fact is a string, or a list of acceptable alternatives (any one is enough), for answers that may be worded
+    in more than one correct way: ["35", "thirty-five"].
+    """
     haystack = normalize(text)
-    return all(normalize(f) in haystack for f in facts)
+    return all(
+        any(normalize(option) in haystack for option in ([fact] if isinstance(fact, str) else fact))
+        for fact in facts
+    )
 
 
 def contains_none(text, markers):
@@ -24,9 +36,13 @@ def contains_none(text, markers):
 
 
 def file_rank(file_names, wanted):
-    """1-based rank of the first hit that comes from `wanted`, or None."""
+    """1-based rank of the first hit that comes from `wanted` (a file name, or a list of equivalent files), or None.
+
+    A list is for the same content published in several files, e.g. one report in three languages.
+    """
+    accepted = {wanted} if isinstance(wanted, str) else set(wanted)
     for rank, name in enumerate(file_names, 1):
-        if name == wanted:
+        if name in accepted:
             return rank
     return None
 

@@ -16,6 +16,8 @@ from pathlib import Path
 from rag import config, db, llm, storage, store
 
 log = logging.getLogger(__name__)
+CHUNK_REPORT_EVERY = 25  # how often cutting reports the number of chunks so far (each report is one database write)
+UPLOAD_BATCH = 64
 
 
 class UnreadableDocument(ValueError):
@@ -28,12 +30,9 @@ def is_supported(path):
 
 def build_pipeline():
     """Load the heavy parsing models once. Imported here so the rest of the package stays light."""
-    from docling.chunking import HybridChunker
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
     from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
-    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
-    from transformers import AutoTokenizer
 
     os.environ["TESSDATA_PREFIX"] = str(config.TESSDATA)  # Docling's language check ignores the `path` option
     pipeline = PdfPipelineOptions(
@@ -43,61 +42,187 @@ def build_pipeline():
         InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline),
         InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline),
     })
+    return converter, build_chunker()
+
+
+def build_chunker(max_tokens=None, tables=None):
+    """The chunker alone (cheap compared to parsing). `tables` is "triplet" (one "row, column = value" sentence per
+    cell, Docling's default) or "markdown" (real table rows; a long table is split between rows and the header row
+    is repeated in every chunk). Defaults come from the configuration."""
+    from docling.chunking import HybridChunker
+    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+    from transformers import AutoTokenizer
+
     tokenizer = HuggingFaceTokenizer(
         tokenizer=AutoTokenizer.from_pretrained(config.TOKENIZER),
-        max_tokens=config.MAX_CHUNK_TOKENS,
+        max_tokens=max_tokens or config.MAX_CHUNK_TOKENS,
     )
-    return converter, HybridChunker(tokenizer=tokenizer)
+    if (tables or config.TABLE_FORMAT) == "markdown":
+        return HybridChunker(tokenizer=tokenizer, serializer_provider=_markdown_tables_provider())
+    return HybridChunker(tokenizer=tokenizer)
 
 
-def convert(converter, path):
+def _markdown_tables_provider():
+    from docling_core.transforms.chunker.hierarchical_chunker import ChunkingDocSerializer, ChunkingSerializerProvider
+    from docling_core.transforms.serializer.markdown import MarkdownTableSerializer
+
+    class MarkdownTablesProvider(ChunkingSerializerProvider):
+        def get_serializer(self, doc):
+            return ChunkingDocSerializer(doc=doc, table_serializer=MarkdownTableSerializer())
+
+    return MarkdownTablesProvider()
+
+
+def _docling_progress(report):
+    """Docling's progress events as positions: pages done of pages in all, then "assembling" once the pages are read.
+    Docling swallows an exception raised inside its callback, so this never raises."""
+    from docling.datamodel.progress import ConversionPhase, PageCompletedProgress, PhaseStartedProgress
+
+    def on_event(event):
+        if isinstance(event, PageCompletedProgress):
+            report("pages", event.completed_pages, event.total_pages)
+        elif isinstance(event, PhaseStartedProgress) and event.phase == ConversionPhase.ASSEMBLE:
+            report("assembling", 0, None)
+
+    return on_event
+
+
+def convert(converter, path, progress=None):
+    """Parse a file into a Docling document. `progress(unit, done, total)` hears about each finished page."""
+    options = {} if progress is None else {"progress_callback": _docling_progress(progress)}
     if path.suffix.lower() == ".txt":  # Docling has no plain-text input; Markdown parses it fine
         from docling.datamodel.base_models import DocumentStream
 
         stream = DocumentStream(name=f"{path.stem}.md", stream=BytesIO(path.read_bytes()))
-        return converter.convert(stream).document
-    return converter.convert(path).document
+        return converter.convert(stream, **options).document
+    return converter.convert(path, **options).document
 
 
-def build_points(document, chunker, source, file_name, file_hash):
-    from qdrant_client import models
-
-    chunks = list(chunker.chunk(document))
-    texts = [chunker.contextualize(chunk) for chunk in chunks]
-    if not any(text.strip() for text in texts):
+def _require_text(items):
+    if not any(text.strip() for text, _, _ in items):
         raise UnreadableDocument("no text could be extracted")
 
-    points = []
-    for index, (chunk, text, vector) in enumerate(zip(chunks, texts, llm.embed(texts), strict=True)):
-        pages = sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov})
-        points.append(models.PointStruct(
-            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{file_hash}:{index}")),
+
+def _points(items, vectors, source, file_name, file_hash, document_id=None, version_id=None):
+    """Qdrant points for the chunks. A versioned chunk's id comes from its version and position, so writing the same
+    version again overwrites the same points instead of adding duplicates."""
+    from qdrant_client import models
+
+    extra = {"document_id": str(document_id), "version_id": str(version_id)} if version_id else {}
+    return [
+        models.PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_URL,
+                              f"{version_id}:{index}" if version_id else f"{source}:{file_hash}:{index}")),
             vector=vector,
             payload={
                 "source": source,
                 "file_name": file_name,
                 "file_hash": file_hash,
                 "chunk_index": index,
-                "chunks_total": len(chunks),
+                "chunks_total": len(items),
                 "pages": pages,
-                "headings": chunk.meta.headings or [],
+                "headings": headings,
                 "text": text,
+                **extra,
             },
-        ))
-    return points
+        )
+        for index, ((text, pages, headings), vector) in enumerate(zip(items, vectors, strict=True))
+    ]
+
+
+def _make_points(items, source, file_name, file_hash):
+    """`items` is one (text, pages, headings) per chunk. Embeds the texts and builds the Qdrant points."""
+    _require_text(items)
+    return _points(items, llm.embed([text for text, _, _ in items]), source, file_name, file_hash)
+
+
+def document_items(document, chunker, progress=None):
+    """Cut a parsed document into (text, pages, headings) chunks. `progress` hears the number cut so far, every
+    CHUNK_REPORT_EVERY chunks: how many there will be is not known until the end."""
+    if progress:
+        progress("chunks", 0, None)
+    items = []
+    for chunk in chunker.chunk(document):
+        items.append((chunker.contextualize(chunk),
+                      sorted({prov.page_no for item in chunk.meta.doc_items for prov in item.prov}),
+                      chunk.meta.headings or []))
+        if progress and len(items) % CHUNK_REPORT_EVERY == 0:
+            progress("chunks", len(items), None)
+    return items
+
+
+def build_points(document, chunker, source, file_name, file_hash):
+    return _make_points(document_items(document, chunker), source, file_name, file_hash)
+
+
+def xlsx_points(path, source, file_hash):
+    """Spreadsheets bypass Docling: it takes a sheet's title row for the column header (see rag/xlsx.py)."""
+    from rag import xlsx
+
+    return _make_points(xlsx.chunks(path), source, path.name, file_hash)
+
+
+def extract_items(converter, chunker, path, progress=None):
+    """Parse a file and cut it into (text, pages, headings) chunks."""
+    if path.suffix.lower() == ".xlsx":
+        from rag import xlsx
+
+        return xlsx.chunks(path)
+    return document_items(convert(converter, path, progress), chunker, progress)
+
+
+def _embed(texts, report):
+    """Vectors for the texts, one Ollama call per batch, with the position reported between the calls."""
+    vectors = []
+    report("chunks", 0, len(texts))
+    for start in range(0, len(texts), config.EMBED_BATCH):
+        vectors += llm.embed(texts[start : start + config.EMBED_BATCH])
+        report("chunks", len(vectors), len(texts))
+    return vectors
+
+
+def _upload(client, points, report):
+    """Write the points in batches, with the position reported after each."""
+    report("chunks", 0, len(points))
+    for start in range(0, len(points), UPLOAD_BATCH):
+        client.upload_points(config.COLLECTION, points=points[start : start + UPLOAD_BATCH], batch_size=UPLOAD_BATCH,
+                             wait=True)
+        report("chunks", min(start + UPLOAD_BATCH, len(points)), len(points))
+
+
+def index_version(client, converter, chunker, path, *, document_id, version_id, file_name, file_hash,
+                  stage=lambda status: None):
+    """Index one document version into its own set of Qdrant points and return the number of chunks written.
+
+    `stage` is told EMBEDDING and INDEXING as the work reaches them (the worker records them, and raises to stop if
+    its claim was lost). If it also has a `progress(unit, done, total)` method (the worker's JobProgress does), that
+    hears pages parsed, chunks cut, chunks embedded and chunks written, which is what the worker's stall limit and the
+    page's progress display are made of. The version's chunks from an earlier attempt are removed first, so a retry
+    never leaves leftovers; no other version is touched. Verifying and activating are the caller's job.
+    """
+    report = getattr(stage, "progress", None)
+    items = (extract_items(converter, chunker, path) if report is None
+             else extract_items(converter, chunker, path, report))
+    report = report or (lambda unit, done, total=None: None)
+    _require_text(items)
+    stage("EMBEDDING")
+    vectors = _embed([text for text, _, _ in items], report)
+    points = _points(items, vectors, str(document_id), file_name, file_hash, document_id, version_id)
+    stage("INDEXING")
+    store.delete_version(client, version_id)
+    _upload(client, points, report)
+    return len(points)
 
 
 def index_file(client, converter, chunker, path, source=None):
-    """Return the number of chunks written, or None if this exact file version is already stored.
-
-    `source` identifies the document in the index (the web app passes the document id; it defaults to the path).
-    """
+    """Evaluation and command-line use, without a database: return the number of chunks written, or None if this
+    exact file is already stored. `source` identifies the document in the index (defaults to the path)."""
     source = source or str(path)
     with path.open("rb") as f:
         file_hash = hashlib.file_digest(f, "sha256").hexdigest()
     if store.is_indexed(client, source, file_hash):
         return None
-    points = build_points(convert(converter, path), chunker, source, path.name, file_hash)
+    points = _make_points(extract_items(converter, chunker, path), source, path.name, file_hash)
     # Old chunks go only after the new ones are embedded, so a parse or embed failure keeps them.
     store.delete_source(client, source)
     client.upload_points(config.COLLECTION, points=points, batch_size=64, wait=True)
@@ -105,14 +230,20 @@ def index_file(client, converter, chunker, path, source=None):
 
 
 def queue_file(name, temp_file, size, repo=db):
-    """Register a fully written temp file as a document and put it in the indexing queue. Returns the document id.
+    """Register a fully written temp file as the next version of the document `name` and queue it for indexing.
 
-    Raises db.Busy when a document with that name is being indexed right now.
+    Returns the version (see db.create_version). A file identical to the newest version is not queued again
+    ("created" is False) and the temp file is discarded.
     """
-    doc_id = repo.upsert_document(name, size)
-    storage.save(doc_id, name, temp_file)
-    repo.enqueue(doc_id)
-    return doc_id
+    with temp_file.open("rb") as f:
+        file_hash = hashlib.file_digest(f, "sha256").hexdigest()
+    version = repo.create_version(name, size, file_hash)
+    if not version["created"]:
+        temp_file.unlink(missing_ok=True)
+        return version
+    storage.save(version["file_path"], temp_file)
+    repo.enqueue(version["id"])
+    return version
 
 
 def main(argv):
@@ -135,14 +266,12 @@ def main(argv):
         else:
             seen.add(src.name)
             temp = storage.temp_dir() / uuid.uuid4().hex
-            try:
-                shutil.copyfile(src, temp)
-                queue_file(src.name, temp, src.stat().st_size)
+            shutil.copyfile(src, temp)
+            if queue_file(src.name, temp, src.stat().st_size)["created"]:
                 queued += 1
                 print(f"QUEUED    {src.name}")
-            except db.Busy:
-                temp.unlink(missing_ok=True)
-                problems.append((src, "is being indexed right now, try again later"))
+            else:
+                problems.append((src, "unchanged, already up to date"))
     for src, reason in problems:
         print(f"SKIPPED   {src.name}: {reason}")
     print(f"\nqueued={queued} skipped={len(problems)}")

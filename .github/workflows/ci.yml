@@ -40,7 +40,9 @@ jobs:
           cache-dependency-path: |
             requirements-core.txt
             requirements-dev.txt
+            requirements-connector.txt
       # Unit tests need no models: only the light dependencies are installed (no Docling / torch).
-      - run: pip install -r requirements-core.txt -r requirements-dev.txt
+      # The connector's own tests (vault, SQL Server driver) need its optional libraries; without them they are skipped.
+      - run: pip install -r requirements-core.txt -r requirements-dev.txt -r requirements-connector.txt
       - run: ruff check .
       - run: pytest

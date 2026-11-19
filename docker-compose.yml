@@ -12,20 +12,35 @@ services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    # Only the server's start-up options; the pg_hba.conf below is what decides who may connect (docs/postgres-hardening.md)
+    command: ["postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf", "-c", "password_encryption=scram-sha-256"]
     ports:
-      - "127.0.0.1:5433:5432" # localhost only; 5433 so it never clashes with another local Postgres
+      - "127.0.0.1:${RAG_PG_PORT:-5433}:5432" # localhost only; 5433 so it never clashes with another local Postgres
     environment:
-      # Development defaults. Real secrets come with the deployment work (plan, stage 5).
-      POSTGRES_USER: rag
-      POSTGRES_PASSWORD: rag
+      # No password here, and none anywhere in this file: the superuser's password is read from a Docker secret, so it
+      # is not in `docker inspect`, the process list or the image. rag_bootstrap is the setup role; it cannot log in over
+      # the network (pg_hba.conf). The roles the application uses are made by `python -m rag db-setup`.
+      POSTGRES_USER: rag_bootstrap
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_bootstrap_password
       POSTGRES_DB: rag
+    secrets:
+      - db_bootstrap_password
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - pg_data:/var/lib/postgresql/data
+      - ./docker/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      test: ["CMD-SHELL", "pg_isready -U rag_bootstrap -d rag"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+# The password files live outside the project, in a directory only the current user can read. start.bat makes them
+# (python -m rag db-secrets) and sets RAG_SECRETS_DIR; on Linux: export RAG_SECRETS_DIR="$(python -m rag db-secrets)"
+secrets:
+  db_bootstrap_password:
+    file: ${RAG_SECRETS_DIR:?run "python -m rag db-secrets" and set RAG_SECRETS_DIR to the directory it prints}/db_bootstrap_password
 
 volumes:
   qdrant_data:

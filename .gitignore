@@ -9,3 +9,16 @@ tessdata/
 # evaluation: real documents, questions and reports can be private
 eval/data/
 eval/reports/
+
+# uploaded documents (the app's own copies): never commit
+storage/
+
+# backups hold every document and the whole database; reports are local state
+backups/
+reports/
+
+# secrets never live in the project (the connector keeps them in the user's profile); these only catch an accident
+.env
+.env.*
+*.secret
+secrets/

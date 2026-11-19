@@ -135,12 +135,105 @@ def test_upload_ask_delete_flow(server, browser):
     assert page.evaluate("window.__xss === undefined") and page.locator(".msg.user img").count() == 0
 
     row = page.locator("#docs li", has_text="05_release.pptx")
-    row.locator("button").click()
-    assert row.locator("button").inner_text() == "Aniqmi?"  # deleting takes two clicks
-    row.locator("button").click()
+    row.locator("button.danger").click()
+    assert row.locator("button.danger").inner_text() == "Aniqmi?"  # deleting takes two clicks
+    row.locator("button.danger").click()
     page.wait_for_function(
         "![...document.querySelectorAll('#docs .name')].some(n => n.innerText === '05_release.pptx')", timeout=30000)
 
     page.set_viewport_size({"width": 390, "height": 780})
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")  # no sideways scroll on a phone
     ctx.close()
+
+
+def test_versions_are_visible_and_a_kept_version_can_be_made_active_again(server, browser):
+    url, _ = server
+    for number, text in enumerate((b"Maxfiy parol: ALFA-111.", b"Maxfiy parol: BETA-222."), 1):
+        httpx.post(f"{url}/api/documents", files=[("files", ("parol.txt", text))])
+        deadline = time.time() + 180
+        while True:
+            found = {d["name"]: d for d in httpx.get(f"{url}/api/documents").json()["documents"]}["parol.txt"]
+            if found["state"] == "done" and found["version"] == number:
+                break
+            assert time.time() < deadline, f"version {number} was not indexed"
+            time.sleep(1)
+
+    ctx = browser.new_context(viewport={"width": 1280, "height": 760}, bypass_csp=True)
+    page = ctx.new_page()
+    page.goto(url)
+    row = page.locator("#docs li", has_text="parol.txt")
+    row.wait_for()
+    page.wait_for_function(
+        "[...document.querySelectorAll('#docs li')].some(li => li.innerText.includes('parol.txt')"
+        " && li.innerText.includes('Tayyor \u00b7 v2'))", timeout=60000)
+    row.get_by_role("button", name="Versiyalar").click()
+    row.locator(".ver").nth(1).wait_for()
+    assert "Faol" in row.locator(".ver", has_text="v2").inner_text()
+    assert "Indekslangan, faol emas" in row.locator(".ver", has_text="v1").inner_text()
+    assert row.locator(".ver", has_text="v2").locator("button").count() == 0  # the active one needs no button
+
+    restore = row.locator(".ver", has_text="v1").locator("button")
+    restore.click()
+    assert restore.inner_text() == "Aniqmi?"  # changing what the answers come from takes two clicks, like deleting
+    restore.click()
+    page.wait_for_function(
+        "[...document.querySelectorAll('#docs li')].some(li => li.innerText.includes('parol.txt')"
+        " && li.innerText.includes('Tayyor \u00b7 v1'))", timeout=60000)
+    assert "Faol" in row.locator(".ver", has_text="v1").inner_text()
+    ctx.close()
+    httpx.delete(f"{url}/api/documents/parol.txt")
+
+
+def test_several_files_reach_the_real_server_one_request_each_one_after_the_other(server, browser):
+    url, _ = server
+    names = ["seq-1.txt", "seq-2.txt", "seq-3.txt"]
+    events = []  # ("request", the request) when it leaves, ("response", None) when the server has answered it
+    ctx = browser.new_context(viewport={"width": 1280, "height": 760}, bypass_csp=True)
+    page = ctx.new_page()
+
+    def is_upload(request):
+        return request.method == "POST" and request.url.rstrip("/").endswith("/api/documents")
+
+    def on_request(request):
+        if is_upload(request):
+            events.append(("request", request))
+
+    def on_response(response):
+        if is_upload(response.request):
+            events.append(("response", None))
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+    page.goto(url)
+    page.wait_for_selector("#docs li")
+    # a different size for each file, so that the requests can be told apart (the browser does not show their bodies)
+    files = [{"name": n, "mimeType": "text/plain", "buffer": (f"{n} matni. " * (10 * (i + 1))).encode()}
+             for i, n in enumerate(names)]
+    page.set_input_files("#file-input", files)
+    page.wait_for_function("document.querySelector('#upload-status').textContent === '3/3 fayl yuklandi'",
+                           timeout=60000)
+    # three requests, each answered before the next one was sent
+    assert [kind for kind, _ in events] == ["request", "response"] * 3
+    sent = [request for kind, request in events if kind == "request"]
+    announced = [r.all_headers().get("content-length") for r in sent]
+    assert all(announced)  # the browser announced the size of each
+    sizes = [int(size) for size in announced]
+    assert sizes == sorted(sizes) and len(set(sizes)) == 3  # one file each, in the order they were chosen
+    assert sizes[0] < len(files[0]["buffer"]) + len(files[1]["buffer"])  # (the first request did not carry the others)
+    page.wait_for_function(  # all three are in the list (the last refresh may still be on its way)
+        "(names) => names.every((n) => [...document.querySelectorAll('#docs .name')].some((e) => e.textContent === n))",
+        arg=names, timeout=30000)
+    ctx.close()
+    created = [httpx.get(f"{url}/api/documents/{n}/versions").json()["versions"][0]["created_at"] for n in names]
+    assert created == sorted(created)  # and the server received them in that order
+
+    def states():
+        listed = {d["name"]: d["state"] for d in httpx.get(f"{url}/api/documents").json()["documents"]}
+        return [listed.get(n) for n in names]
+
+    deadline = time.time() + 180
+    while states() != ["done"] * 3:
+        assert time.time() < deadline, "the three small files were not indexed"
+        time.sleep(1)
+    for name in names:
+        assert httpx.delete(f"{url}/api/documents/{name}").status_code == 200

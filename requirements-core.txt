@@ -3,5 +3,6 @@ uvicorn==0.54.0
 python-multipart==0.0.33
 ollama==0.6.3
 qdrant-client==1.20.0
+openpyxl==3.1.5
 psycopg[binary,pool]==3.3.7
 psycopg-pool==3.3.3

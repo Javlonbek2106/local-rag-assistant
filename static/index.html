@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
   <title>Hujjatlar yordamchisi</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/app.css">
@@ -12,30 +13,113 @@
     <h1>Hujjatlar yordamchisi</h1>
     <span class="muted">Hamma narsa shu kompyuterda ishlaydi</span>
   </header>
-  <div id="banner" class="banner" hidden></div>
+  <div id="banner" class="banner" role="alert" hidden></div>
   <main>
-    <aside>
+    <aside aria-label="Hujjatlar">
       <h2>Hujjatlar</h2>
-      <label id="drop" class="drop" tabindex="0">
+      <label id="drop" class="drop" tabindex="0" role="button">
         <input id="file-input" type="file" multiple hidden>
         <strong>Fayllarni shu yerga tashlang</strong>
         <span class="muted">yoki bosib tanlang<br>PDF, Word, Excel, PowerPoint, HTML, rasm, matn</span>
       </label>
-      <div id="upload-msg" class="upload-msg" hidden></div>
-      <ul id="docs" class="docs"></ul>
+      <div id="upload-status" class="upload-status" role="status" aria-live="polite" hidden></div>
+      <progress id="upload-progress" class="bar upload-bar" aria-label="Fayllarni yuklash taraqqiyoti" hidden></progress>
+      <div id="upload-msg" class="upload-msg" role="alert" hidden></div>
+      <ul id="docs" class="docs" aria-label="Hujjatlar ro'yxati"></ul>
       <p id="docs-empty" class="muted" hidden>Hozircha hujjat yo'q.</p>
+      <section id="connector-auth" class="connector-auth" aria-label="Ulagich kirishi" hidden>
+        <h2>Ulagich</h2>
+        <p id="connector-state" class="muted" role="status"></p>
+        <div id="pair-box" hidden>
+          <button id="pair-request" type="button">Kod so'rash</button>
+          <p class="muted">Kod ilova oynasida (start.bat) ko'rinadi.</p>
+          <form id="pair-form" class="pair-form">
+            <label for="pair-code" class="muted">8 xonali kod</label>
+            <input id="pair-code" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="9" data-focus-key="pair-code">
+            <button id="pair-send" type="submit">Kirish</button>
+          </form>
+        </div>
+        <div id="session-box" hidden>
+          <p id="session-info" class="muted"></p>
+          <button id="session-end" type="button">Chiqish</button>
+        </div>
+        <div id="connector-msg" class="upload-msg" role="alert" hidden></div>
+      </section>
     </aside>
-    <section class="chat">
+    <section class="chat" aria-label="Savol-javob">
       <h2>Savol-javob</h2>
-      <div id="log" class="log" aria-live="polite">
+      <div id="log" class="log" role="log" aria-label="Savol-javob tarixi" aria-live="polite" aria-busy="false">
         <p id="hint" class="muted">Hujjatlar tayyor bo'lgach, savolingizni yozing. Javob faqat shu hujjatlardan olinadi va manbasi ko'rsatiladi.</p>
       </div>
       <form id="ask-form" class="ask">
-        <textarea id="question" rows="2" maxlength="2000" placeholder="Savolingizni yozing… (Enter — yuborish, Shift+Enter — yangi qator)" required></textarea>
+        <label for="question" class="sr-only">Savolingiz</label>
+        <span id="question-help" class="sr-only">Enter — yuborish, Shift+Enter — yangi qator</span>
+        <textarea id="question" rows="2" maxlength="2000" aria-describedby="question-help" placeholder="Savolingizni yozing… (Enter — yuborish, Shift+Enter — yangi qator)" required></textarea>
         <button id="send" type="submit">Yuborish</button>
       </form>
     </section>
   </main>
+  <details id="connections" class="connections" hidden>
+    <summary>Ulanishlar: tashqi bazalar (PostgreSQL, SQL Server)</summary>
+    <p class="muted">Tashqi bazaga faqat o'qish uchun ulanadi: jadval va ustun nomlari o'qiladi, ma'lumot qatorlari nusxalanmaydi. Parol shifrlab saqlanadi va hech qachon qaytarilmaydi.</p>
+    <div id="cn-msg" class="upload-msg" role="alert" hidden></div>
+    <div class="cn-actions"><button id="cn-new" type="button">Yangi ulanish</button></div>
+    <section id="cn-stepup" class="cn-box" aria-label="Tasdiqlash" hidden>
+      <p>Bu amal uchun yangi kod bilan tasdiqlang. Kod ilova oynasida (start.bat) ko'rinadi.</p>
+      <button id="cn-stepup-request" type="button">Kod so'rash</button>
+      <form id="cn-stepup-form" class="pair-form">
+        <label for="cn-stepup-code" class="muted">8 xonali kod</label>
+        <input id="cn-stepup-code" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="9">
+        <div class="cn-actions"><button type="submit">Tasdiqlash</button><button id="cn-stepup-cancel" type="button">Bekor qilish</button></div>
+      </form>
+    </section>
+    <form id="cn-form" class="cn-box cn-form" autocomplete="off" hidden>
+      <h3 id="cn-form-title">Yangi ulanish</h3>
+      <label for="cn-name">Nomi</label><input id="cn-name" type="text" maxlength="100" required>
+      <label for="cn-description">Tavsif</label><input id="cn-description" type="text" maxlength="2000">
+      <label for="cn-provider">Baza turi</label>
+      <select id="cn-provider"><option value="postgresql">PostgreSQL</option><option value="mssql">Microsoft SQL Server</option></select>
+      <label for="cn-host">Host</label><input id="cn-host" type="text" maxlength="253" spellcheck="false" required>
+      <label for="cn-port">Port</label><input id="cn-port" type="number" min="1" max="65535" required>
+      <label for="cn-database">Baza nomi</label><input id="cn-database" type="text" maxlength="128" spellcheck="false" required>
+      <label for="cn-username">Foydalanuvchi</label><input id="cn-username" type="text" maxlength="128" autocomplete="off" spellcheck="false" required>
+      <label for="cn-password">Parol</label><input id="cn-password" type="password" maxlength="1024" autocomplete="new-password">
+      <label for="cn-ssl">Shifrlash (TLS)</label>
+      <select id="cn-ssl">
+        <option value="verify-full">Sertifikat va host nomi tekshiriladi (tavsiya)</option>
+        <option value="verify-ca">Sertifikat tekshiriladi</option>
+        <option value="require">Shifrlanadi, tekshirilmaydi (SQL Server da yo'q)</option>
+        <option value="disable">Shifrlanmaydi (faqat shu kompyuter)</option>
+      </select>
+      <label class="cn-check"><input id="cn-insecure" type="checkbox"> Boshqa kompyuter uchun zaif rejim xavfini qabul qilaman</label>
+      <label for="cn-ca">Server CA sertifikati (PEM; SQL Server uchun shart)</label><textarea id="cn-ca" rows="3" spellcheck="false"></textarea>
+      <label for="cn-timeout">Ulanish vaqti, soniya (ixtiyoriy, 1–30)</label><input id="cn-timeout" type="number" min="1" max="30">
+      <div class="cn-actions"><button id="cn-save" type="submit">Saqlash</button><button id="cn-cancel" type="button">Bekor qilish</button></div>
+    </form>
+    <ul id="cn-list" class="cn-list" aria-label="Ulanishlar ro'yxati"></ul>
+    <p id="cn-empty" class="muted" hidden>Hozircha ulanish yo'q.</p>
+    <section id="cn-schema" class="cn-box" aria-label="Sxema ko'rinishi" hidden>
+      <div class="cn-head"><h3 id="cn-schema-title">Sxema</h3><button id="cn-schema-close" type="button">Yopish</button></div>
+      <div id="cn-fresh" class="cn-fresh"></div>
+      <div id="cn-changes" class="cn-changes" hidden></div>
+      <div class="cn-actions">
+        <button id="cn-show-changes" type="button">O'zgarishlarni ko'rish</button>
+        <button id="cn-save-selection" type="button">Tanlovni saqlash</button>
+        <button id="cn-show-context" type="button">AI konteksti ko'rinishi</button>
+      </div>
+      <p id="cn-selection-note" class="muted"></p>
+      <ul id="cn-unavailable" class="cn-keys" aria-label="Endi mavjud bo'lmagan tanlovlar" hidden></ul>
+      <ul id="cn-orphans" class="cn-keys" aria-label="Yetim tavsiflar" hidden></ul>
+      <div id="cn-context" class="cn-context" hidden></div>
+      <div id="cn-schema-top"></div>
+      <label for="cn-search" class="muted">Jadval qidirish</label><input id="cn-search" type="search" maxlength="200" autocomplete="off">
+      <p id="cn-objects-total" class="muted"></p>
+      <ul id="cn-objects" class="cn-objects"></ul>
+      <button id="cn-more" type="button" hidden>Yana ko'rsatish</button>
+      <div id="cn-object" class="cn-object"></div>
+    </section>
+  </details>
+  <div id="sr-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>
