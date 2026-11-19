@@ -1,0 +1,5 @@
+# The external database connector (docs/connector.md). Optional: the application and the CI that installs only
+# requirements-core.txt and requirements-dev.txt work without it; the connector says "driver_missing" / "crypto_unavailable".
+cryptography==50.0.2   # AES-256-GCM for the credential vault, parsing of CA certificates
+python-tds==1.17.1     # SQL Server (pure Python, no system ODBC driver)
+pyOpenSSL==26.4.0      # TLS for python-tds (certificate-checked connections to SQL Server)

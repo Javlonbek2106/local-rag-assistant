@@ -599,6 +599,7 @@ function showConnector(mode, info) {
   };
   setText($("connector-state"), states[mode] || "");
   if (mode === "session") setText($("session-info"), `Sessiya: ${Math.ceil(info.absolute_remaining_s / 60)} daqiqa qoldi`);
+  onConnectorMode(mode);
 }
 
 // Asking where the session stands does not keep it alive: the server counts it as a look, not a use.
@@ -697,6 +698,778 @@ $("session-end").addEventListener("click", async () => {
   await refreshSession();
   if (!$("pair-box").hidden) $("pair-request").focus();
 });
+
+// ---------- external database connections (roadmap M4.1b, docs/connector.md) ----------
+// Everything here talks only to /api/v1/connections through connectorFetch (the session token never goes anywhere else). The
+// password is typed into a field, sent once and cleared; it is never shown, stored in the page or read back (the server never
+// returns it). All texts are set with textContent: names, hosts and descriptions of external databases are not trusted.
+const CN_TEXT = {
+  invalid_provider: "Baza turi noto'g'ri.", invalid_host: "Host noto'g'ri.", invalid_port: "Port noto'g'ri (1–65535).",
+  invalid_database: "Baza nomi noto'g'ri.", invalid_username: "Foydalanuvchi nomi noto'g'ri.",
+  invalid_credential: "Parol noto'g'ri (1–1024 belgi).", invalid_ssl_mode: "Shifrlash rejimi noto'g'ri yoki bu bazada mavjud emas.",
+  invalid_options: "Qo'shimcha sozlama noto'g'ri.", invalid_name: "Nom noto'g'ri (1–100 belgi).",
+  invalid_description: "Tavsif noto'g'ri.", invalid_target: "Tavsif uchun obyekt noto'g'ri.", invalid_request: "So'rov noto'g'ri.",
+  tls_required: "Boshqa kompyuterdagi baza uchun shifrlash va sertifikat tekshiruvi kerak. Zaif rejimni tanlasangiz, xavfni qabul qilganingizni belgilang.",
+  ca_required: "SQL Server uchun serverning CA sertifikati (PEM) kerak.", host_blocked: "Bu manzilga ulanishga ruxsat yo'q.",
+  host_not_allowed: "Bu host ruxsat etilgan ro'yxatda yo'q.", host_unresolvable: "Host topilmadi.",
+  internal_database: "Bu ilovaning o'z bazasi: uni tashqi baza sifatida ulab bo'lmaydi.", name_taken: "Bu nom band.",
+  limit_reached: "Ulanishlar soni chegarasiga yetildi.", not_found: "Topilmadi.", object_not_found: "Bunday jadval yoki ustun topilmadi.",
+  connection_disabled: "Ulanish o'chirilgan. Avval yoqing.", needs_credentials: "Parolni qayta kiriting (shifrlash kaliti bilan ochilmadi).",
+  key_unavailable: "Shifrlash kaliti yo'q yoki o'qib bo'lmaydi. Ilova oynasida: python -m rag connector key-init",
+  busy: "Band. Biroz kutib, qayta urining.", security_log_unavailable: "Xavfsizlik jurnaliga yozib bo'lmadi: o'zgartirish qilinmadi.",
+  discovery_failed: "Sxemani aniqlab bo'lmadi.", connector_unavailable: "Ulagich hozir ishlamayapti.",
+  step_up_required: "Tasdiqlash kerak.",
+  auth_failed: "Foydalanuvchi yoki parol noto'g'ri.", database_not_found: "Baza topilmadi.", timeout: "Javob kelmadi (vaqt tugadi).",
+  unreachable: "Serverga ulanib bo'lmadi.", tls_failed: "Shifrlash yoki sertifikat xatosi.", permission_denied: "Ruxsat yo'q.",
+  too_large: "Sxema juda katta.", driver_missing: "Kerakli drayver o'rnatilmagan (requirements-connector.txt).", failed: "Xato.",
+  context_stale: "Sxema konteksti hozir yangi emas.", selection_conflict: "Tanlov boshqa joyda o'zgartirilgan. Sahifani yangilab, qayta urining.",
+  snapshot_changed: "Sxema yangilangan. Sahifani yangilang.", snapshot_not_found: "Bunday sxema versiyasi yo'q.",
+  invalid_selection: "Tanlov noto'g'ri.", description_contains_secret: "Tavsifda parol yoki kalit bor: yozish mumkin emas.",
+  request_too_large: "So'rov juda katta.", not_in_snapshot: "Bu obyekt joriy sxemada yo'q.", stale: "Sxema eskirgan.",
+  failed: "Xato.", in_progress: "Sxema aniqlanmoqda.", never_discovered: "Sxema hali aniqlanmagan.",
+  exclude_without_scope: "Jadvalni chiqarib tashlash uchun uning sxemasi tanlangan bo'lishi kerak.",
+  exclude_without_table: "Ustunni chiqarib tashlash uchun butun jadval tanlangan bo'lishi kerak.",
+  account_can_write: "Diqqat: bu hisob ma'lumotni o'zgartira oladi. Faqat o'qish huquqli hisobdan foydalaning.",
+};
+const CN_STATUS = { ready: "Tayyor", disabled: "O'chirilgan", needs_credentials: "Parol kerak" };
+const CN_PROVIDER = { postgresql: "PostgreSQL", mssql: "SQL Server" };
+const CN_PORT = { postgresql: 5432, mssql: 1433 };
+let cnConnections = [];
+let cnLoaded = false;
+let cnEditing = null; // the connection being edited, or null for a new one
+let cnPending = null; // the action that waits for a step-up confirmation
+let cnSchema = null; // {connection, schema, query, offset}
+let cnSel = null; // {revision, items, dirty}: the selection being edited (what may appear in AI context)
+let cnFresh = null; // the last freshness answer
+const cnArmed = new Set();
+
+function cnCodeText(code, reason) {
+  const base = CN_TEXT[code] || "Xato.";
+  return reason && CN_TEXT[reason] ? `${base} ${CN_TEXT[reason]}` : base;
+}
+
+function cnMessage(text, kind) {
+  const box = $("cn-msg");
+  box.hidden = !text;
+  setText(box, text || "");
+  setClass(box, `upload-msg${kind === "ok" ? " ok" : ""}`);
+}
+
+function cnWhen(value) {
+  return value ? new Date(value).toLocaleString() : "";
+}
+
+async function cnApi(method, path, body) {
+  const options = { method, headers: {} };
+  if (body !== undefined) {
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const res = await connectorFetch(`/api/v1/connections${path}`, options);
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  return { status: res.status, data };
+}
+
+// Runs an action; 401 ends the session, 403 step_up_required asks for a fresh code and runs the action again afterwards.
+async function cnRun(action) {
+  let result;
+  try {
+    result = await action();
+  } catch {
+    cnMessage("Server bilan aloqa yo'q.");
+    return null;
+  }
+  const code = result.data && result.data.error ? result.data.error.code : null;
+  if (result.status === 401) {
+    storeToken(null);
+    await refreshSession();
+    return null;
+  }
+  if (result.status === 403 && code === "step_up_required") {
+    cnPending = action;
+    $("cn-stepup").hidden = false;
+    cnMessage("");
+    announce("Tasdiqlash uchun yangi kod kerak.");
+    $("cn-stepup-request").focus();
+    return null;
+  }
+  if (result.status >= 400) {
+    cnMessage(cnCodeText(code, result.data && result.data.error ? result.data.error.reason : null));
+    return null;
+  }
+  return result;
+}
+
+$("cn-stepup-request").addEventListener("click", async () => {
+  try {
+    const res = await connectorFetch("/api/v1/session/pairing", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ purpose: "step-up" }),
+    });
+    if (res.status === 200) {
+      announce("Kod ilova oynasida ko'rsatildi.");
+      $("cn-stepup-code").focus();
+    } else {
+      cnMessage(res.status === 429 ? "Juda tez. Bir necha soniyadan keyin qayta so'rang." : "Kod so'rab bo'lmadi.");
+    }
+  } catch {
+    cnMessage("Server bilan aloqa yo'q.");
+  }
+});
+
+$("cn-stepup-cancel").addEventListener("click", () => {
+  cnPending = null;
+  $("cn-stepup").hidden = true;
+  $("cn-stepup-code").value = "";
+});
+
+$("cn-stepup-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const code = $("cn-stepup-code").value.trim();
+  $("cn-stepup-code").value = ""; // never kept, whatever the answer
+  if (!code) return;
+  try {
+    const res = await connectorFetch("/api/v1/session/step-up", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }),
+    });
+    if (res.status === 200) {
+      storeToken((await res.json()).token); // the confirmation replaces the token
+      $("cn-stepup").hidden = true;
+      const again = cnPending;
+      cnPending = null;
+      if (again) await cnPerform(again);
+    } else if (res.status === 401) {
+      cnMessage("Kod noto'g'ri yoki eskirgan. Yangi kod so'rang.");
+    } else {
+      cnMessage(res.status === 429 ? "Juda ko'p urinish. Biroz kutib, yangi kod so'rang." : "Tasdiqlab bo'lmadi.");
+    }
+  } catch {
+    cnMessage("Server bilan aloqa yo'q.");
+  }
+});
+
+// Runs an action and, when it succeeded, what it wants done afterwards (`action.after`). A step-up that interrupts it makes
+// it run again later through here, so the follow-up is never lost.
+async function cnPerform(action) {
+  const result = await cnRun(action);
+  if (result && action.after) await action.after(result);
+  return result;
+}
+
+// ----- the list -----
+
+let cnLoading = false; // a second look while the first is still on its way would draw the list twice
+async function refreshConnections() {
+  if (cnLoading) return;
+  cnLoading = true;
+  try {
+    const result = await cnRun(() => cnApi("GET", ""));
+    if (!result) return;
+    cnConnections = result.data.connections;
+    cnLoaded = true;
+    renderConnections();
+  } finally {
+    cnLoading = false;
+  }
+}
+
+function connectionSummary(c) {
+  return `${CN_PROVIDER[c.provider] || c.provider} · ${c.host}:${c.port} / ${c.database_name} · ${c.username}`;
+}
+
+function testLine(c) {
+  if (!c.last_tested_at) return "Hali sinalmagan";
+  const when = cnWhen(c.last_tested_at);
+  return c.last_test_status === "ok" ? `Oxirgi sinov: muvaffaqiyatli (${when})` : `Oxirgi sinov: xato, ${cnCodeText(c.last_test_error)} (${when})`;
+}
+
+function cnButton(label, onClick, extra) {
+  const button = el("button", extra || "", label);
+  button.type = "button";
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function connectionRow(c) {
+  const row = el("li", "cn-item");
+  row.dataset.id = c.id;
+  const head = el("div", "cn-head");
+  head.append(el("strong", "cn-name", c.name), el("span", `cn-status ${c.status}`, CN_STATUS[c.status] || c.status));
+  const lines = [el("div", "muted", connectionSummary(c)), el("div", "muted", testLine(c))];
+  if (c.description) lines.push(el("div", "cn-desc", c.description));
+  if (c.last_test_warning) lines.push(el("div", "update warn", cnCodeText(c.last_test_warning)));
+  lines.push(el("div", "muted", c.schema_discovered_at ? `Sxema aniqlangan: ${cnWhen(c.schema_discovered_at)}` : "Sxema hali aniqlanmagan"));
+  const actions = el("div", "cn-actions");
+  actions.append(
+    cnButton("Sinash", () => testConnection(c)),
+    cnButton(c.is_enabled ? "O'chirib qo'yish" : "Yoqish", () => toggleConnection(c)),
+    cnButton("Tahrirlash", () => editConnection(c)),
+    cnButton("Sxemani aniqlash", () => discoverSchema(c)),
+    cnButton("Sxemani ko'rish", () => openSchema(c)),
+    deleteConnectionButton(c),
+  );
+  row.append(head, ...lines, actions);
+  setAttr(row, "aria-label", `Ulanish: ${c.name}`);
+  return row;
+}
+
+function renderConnections() {
+  const list = $("cn-list");
+  list.replaceChildren(...cnConnections.map(connectionRow));
+  $("cn-empty").hidden = cnConnections.length > 0;
+}
+
+async function testConnection(c) {
+  cnMessage("Sinalmoqda…", "ok");
+  const result = await cnRun(() => cnApi("POST", `/${c.id}/test`));
+  if (!result) return;
+  const t = result.data;
+  cnMessage(t.status === "ok" ? `Ulanish ishlayapti${t.server_version ? ` (server ${t.server_version})` : ""}.${t.warning ? " " + cnCodeText(t.warning) : ""}`
+    : cnCodeText(t.error), t.status === "ok" ? "ok" : undefined);
+  announce(t.status === "ok" ? "Ulanish ishlayapti." : "Ulanish sinovi muvaffaqiyatsiz.");
+  await refreshConnections();
+}
+
+async function toggleConnection(c) {
+  const result = await cnRun(() => cnApi("POST", `/${c.id}/${c.is_enabled ? "disable" : "enable"}`));
+  if (result) await refreshConnections();
+}
+
+function deleteConnectionButton(c) {
+  const button = el("button", "danger", "O'chirish");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    if (!cnArmed.has(c.id)) {
+      cnArmed.add(c.id);
+      setText(button, "Aniqmi?");
+      announce("Tasdiqlash uchun yana bir marta bosing");
+      setTimeout(() => { cnArmed.delete(c.id); setText(button, "O'chirish"); }, 3000);
+      return;
+    }
+    cnArmed.delete(c.id);
+    const result = await cnRun(() => cnApi("DELETE", `/${c.id}`));
+    if (result) {
+      if (cnSchema && cnSchema.connection.id === c.id) closeSchema();
+      await refreshConnections();
+    }
+  });
+  return button;
+}
+
+async function discoverSchema(c) {
+  cnMessage("Sxema aniqlanmoqda…", "ok");
+  const result = await cnRun(() => cnApi("POST", `/${c.id}/schema/discover`));
+  if (!result) return;
+  const snap = result.data.snapshot;
+  const what = !snap ? "" : snap.first ? " Birinchi versiya saqlandi." : snap.changed ? ` Yangi versiya ${snap.version}: ${snap.changes} o'zgarish.` : ` O'zgarish yo'q (versiya ${snap.version}).`;
+  cnMessage(`Sxema aniqlandi: ${result.data.objects} jadval va ko'rinish, ${result.data.columns} ustun.${what}`, "ok");
+  announce("Sxema aniqlandi.");
+  await refreshConnections();
+  if (cnSchema && cnSchema.connection.id === c.id) await openSchema(cnConnections.find((x) => x.id === c.id) || c);
+}
+
+// ----- the form -----
+
+function showForm(connection) {
+  cnEditing = connection;
+  const form = $("cn-form");
+  form.hidden = false;
+  $("cn-form-title").textContent = connection ? `Tahrirlash: ${connection.name}` : "Yangi ulanish";
+  $("cn-name").value = connection ? connection.name : "";
+  $("cn-description").value = connection ? connection.description : "";
+  $("cn-provider").value = connection ? connection.provider : "postgresql";
+  $("cn-host").value = connection ? connection.host : "";
+  $("cn-port").value = connection ? connection.port : CN_PORT.postgresql;
+  $("cn-database").value = connection ? connection.database_name : "";
+  $("cn-username").value = connection ? connection.username : "";
+  $("cn-password").value = "";
+  setAttr($("cn-password"), "placeholder", connection ? "(o'zgartirilmaydi)" : "");
+  $("cn-ssl").value = connection ? connection.ssl_mode : "verify-full";
+  $("cn-insecure").checked = Boolean(connection && connection.options.accept_insecure_tls);
+  $("cn-ca").value = "";
+  setAttr($("cn-ca"), "placeholder", connection && connection.ca_certificate_set ? "(sertifikat saqlangan; yangisini kiritsangiz almashadi)" : "-----BEGIN CERTIFICATE-----");
+  $("cn-timeout").value = connection && connection.options.connect_timeout_s ? connection.options.connect_timeout_s : "";
+  cnMessage("");
+  $("cn-name").focus();
+}
+
+function hideForm() {
+  $("cn-form").hidden = true;
+  $("cn-password").value = "";
+  cnEditing = null;
+}
+
+function editConnection(c) {
+  showForm(c);
+}
+
+$("cn-new").addEventListener("click", () => showForm(null));
+$("cn-cancel").addEventListener("click", () => { hideForm(); $("cn-new").focus(); });
+$("cn-provider").addEventListener("change", () => {
+  if (!cnEditing) $("cn-port").value = CN_PORT[$("cn-provider").value];
+});
+
+function formValues() {
+  const options = {};
+  const timeout = $("cn-timeout").value.trim();
+  if (timeout) options.connect_timeout_s = Number(timeout);
+  if ($("cn-insecure").checked) options.accept_insecure_tls = true;
+  const ca = $("cn-ca").value.trim();
+  if (ca) options.ca_certificate_pem = ca;
+  return {
+    name: $("cn-name").value, description: $("cn-description").value, provider: $("cn-provider").value, host: $("cn-host").value,
+    port: Number($("cn-port").value), database_name: $("cn-database").value, username: $("cn-username").value,
+    ssl_mode: $("cn-ssl").value, options,
+  };
+}
+
+// The fields that differ from the stored connection. A stored CA certificate is not sent back (the server keeps it unless a new
+// one is given), and the password only when something was typed.
+function changedFields(values, stored) {
+  const changed = {};
+  for (const key of ["name", "description", "provider", "host", "port", "database_name", "username", "ssl_mode"]) {
+    if (values[key] !== stored[key]) changed[key] = values[key];
+  }
+  const keep = { ...values.options };
+  const had = { ...stored.options };
+  if (JSON.stringify(Object.entries(keep).filter(([k]) => k !== "ca_certificate_pem").sort())
+      !== JSON.stringify(Object.entries(had).sort()) || keep.ca_certificate_pem) {
+    changed.options = keep;
+  }
+  return changed;
+}
+
+$("cn-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const values = formValues();
+  const password = $("cn-password").value;
+  const editing = cnEditing;
+  let action;
+  if (editing) {
+    const body = changedFields(values, editing);
+    if (password) body.password = password;
+    if (!Object.keys(body).length) {
+      hideForm();
+      cnMessage("Hech narsa o'zgarmadi.");
+      return;
+    }
+    action = () => cnApi("PATCH", `/${editing.id}`, body);
+  } else {
+    action = () => cnApi("POST", "", { ...values, password });
+  }
+  action.after = async () => {
+    hideForm();
+    cnMessage(editing ? "Ulanish yangilandi." : "Ulanish saqlandi.", "ok");
+    announce(editing ? "Ulanish yangilandi." : "Ulanish saqlandi.");
+    await refreshConnections();
+  };
+  const sent = await cnPerform(action);
+  if (sent) $("cn-password").value = ""; // the password is gone from the page as soon as it was sent
+});
+
+// ----- the schema browser -----
+
+function closeSchema() {
+  cnSchema = null;
+  cnSel = null;
+  cnFresh = null;
+  $("cn-schema").hidden = true;
+  for (const id of ["cn-changes", "cn-context", "cn-unavailable", "cn-orphans"]) { $(id).hidden = true; $(id).replaceChildren(); }
+  $("cn-fresh").replaceChildren();
+}
+
+async function openSchema(c) {
+  const [schemas, descriptions] = await Promise.all([
+    cnRun(() => cnApi("GET", `/${c.id}/schema`)), cnRun(() => cnApi("GET", `/${c.id}/descriptions`)),
+  ]);
+  if (!schemas || !descriptions) return;
+  cnSchema = { connection: c, schemas: schemas.data.schemas, descriptions: descriptions.data.descriptions, schema: null, query: "", offset: 0 };
+  $("cn-schema").hidden = false;
+  $("cn-schema-title").textContent = `Sxema: ${c.name}`;
+  for (const id of ["cn-changes", "cn-context"]) { $(id).hidden = true; $(id).replaceChildren(); }
+  await loadSelection();
+  await loadFreshness();
+  renderSchemaTop();
+  renderOrphans();
+  await loadObjects(true);
+  $("cn-schema").scrollIntoView({ block: "nearest" });
+}
+
+function descriptionOf(kind, schema, object, column) {
+  const found = cnSchema.descriptions.find((d) => d.target_kind === kind && d.schema_name === (schema || "")
+    && d.object_name === (object || "") && d.column_name === (column || ""));
+  return found ? found.description : "";
+}
+
+async function saveDescription(kind, schema, object, column, text, field) {
+  const connection = cnSchema.connection;
+  const result = await cnRun(() => cnApi("PUT", `/${connection.id}/descriptions`, {
+    target_kind: kind, schema_name: schema || "", object_name: object || "", column_name: column || "", description: text,
+  }));
+  if (!result) return;
+  cnSchema.descriptions = cnSchema.descriptions.filter((d) => !(d.target_kind === kind && d.schema_name === (schema || "")
+    && d.object_name === (object || "") && d.column_name === (column || "")));
+  if (text) cnSchema.descriptions.push(result.data);
+  cnMessage(text ? "Tavsif saqlandi." : "Tavsif o'chirildi.", "ok");
+  announce(text ? "Tavsif saqlandi." : "Tavsif o'chirildi.");
+  if (field) field.dataset.saved = text;
+}
+
+function descriptionEditor(label, kind, schema, object, column) {
+  const wrap = el("div", "cn-desc-edit");
+  const id = `cn-d-${Math.random().toString(36).slice(2, 9)}`;
+  const text = el("label", "muted", label);
+  text.htmlFor = id;
+  const field = el("textarea");
+  field.id = id;
+  field.rows = 2;
+  field.maxLength = 4000;
+  field.value = descriptionOf(kind, schema, object, column);
+  field.dataset.saved = field.value;
+  const save = cnButton("Saqlash", () => saveDescription(kind, schema, object, column, field.value.trim(), field));
+  wrap.append(text, field, save);
+  return wrap;
+}
+
+function renderSchemaTop() {
+  const top = $("cn-schema-top");
+  const items = [descriptionEditor("Baza tavsifi", "database", "", "", "")];
+  const bar = el("div", "cn-actions");
+  const all = cnButton("Hamma sxema", () => selectSchema(null), cnSchema.schema === null ? "primary" : "");
+  bar.append(all);
+  for (const s of cnSchema.schemas) {
+    bar.append(selectionBox(`${s.schema_name} sxemasini AI kontekstiga qo'shish`, { kind: "schema", schema: s.schema_name, object: "", column: "" }),
+      cnButton(`${s.schema_name} (${s.tables} + ${s.views})`, () => selectSchema(s.schema_name), cnSchema.schema === s.schema_name ? "primary" : ""));
+  }
+  items.push(bar);
+  if (cnSchema.schema) items.push(descriptionEditor(`Sxema tavsifi: ${cnSchema.schema}`, "schema", cnSchema.schema, "", ""));
+  if (!cnSchema.schemas.length) items.push(el("p", "muted", "Sxema hali aniqlanmagan yoki hech narsa ko'rinmaydi. «Sxemani aniqlash» ni bosing."));
+  top.replaceChildren(...items);
+  syncChecks();
+}
+
+async function selectSchema(name) {
+  cnSchema.schema = name;
+  cnSchema.offset = 0;
+  renderSchemaTop();
+  await loadObjects(true);
+}
+
+async function loadObjects(reset) {
+  const c = cnSchema.connection;
+  if (reset) cnSchema.offset = 0;
+  const params = new URLSearchParams({ limit: "100", offset: String(cnSchema.offset) });
+  if (cnSchema.schema) params.set("schema", cnSchema.schema);
+  if (cnSchema.query) params.set("q", cnSchema.query);
+  const result = await cnRun(() => cnApi("GET", `/${c.id}/schema/objects?${params}`));
+  if (!result) return;
+  const list = $("cn-objects");
+  const rows = result.data.objects.map((o) => {
+    const li = el("li");
+    const button = cnButton(`${o.schema_name}.${o.object_name}`, () => showObject(o.schema_name, o.object_name), "link");
+    li.append(selectionBox(`${o.schema_name}.${o.object_name} ni AI kontekstiga qo'shish`, { kind: "table", schema: o.schema_name, object: o.object_name, column: "" }), button, el("span", "muted", ` ${o.object_type === "table" ? "jadval" : "ko'rinish"} · ${o.columns} ustun`));
+    return li;
+  });
+  if (reset) list.replaceChildren(...rows); else list.append(...rows);
+  syncChecks();
+  cnSchema.offset += result.data.objects.length;
+  $("cn-more").hidden = cnSchema.offset >= result.data.total;
+  setText($("cn-objects-total"), `${result.data.total} ta obyekt`);
+  if (reset) $("cn-object").replaceChildren();
+}
+
+$("cn-search").addEventListener("input", () => {
+  if (!cnSchema) return;
+  cnSchema.query = $("cn-search").value.trim();
+  loadObjects(true);
+});
+$("cn-more").addEventListener("click", () => loadObjects(false));
+$("cn-schema-close").addEventListener("click", closeSchema);
+
+function keyMarks(detail) {
+  const marks = new Map();
+  const add = (column, mark) => marks.set(column, [...(marks.get(column) || []), mark]);
+  for (const k of detail.constraints) {
+    for (const column of k.columns) add(column, { primary_key: "PK", unique: "U", foreign_key: "FK" }[k.kind]);
+  }
+  return marks;
+}
+
+async function showObject(schema, name) {
+  const c = cnSchema.connection;
+  const params = new URLSearchParams({ schema, name });
+  const result = await cnRun(() => cnApi("GET", `/${c.id}/schema/object?${params}`));
+  if (!result) return;
+  const d = result.data;
+  const marks = keyMarks(d);
+  const box = $("cn-object");
+  const title = el("h3", "", `${d.schema}.${d.name} (${d.type === "table" ? "jadval" : "ko'rinish"})`);
+  const table = el("table", "cn-table");
+  const head = el("tr");
+  for (const h of ["AI", "Ustun", "Tur", "Bo'sh bo'lishi", "Kalit", "Tavsif"]) head.append(el("th", "", h));
+  table.append(head);
+  for (const col of d.columns) {
+    const tr = el("tr");
+    const pick = el("td");
+    pick.append(selectionBox(`${d.name}.${col.column_name} ustunini AI kontekstiga qo'shish`, { kind: "column", schema: d.schema, object: d.name, column: col.column_name }));
+    tr.append(pick, el("td", "", col.column_name), el("td", "", col.data_type), el("td", "", col.is_nullable ? "ha" : "yo'q"),
+      el("td", "", (marks.get(col.column_name) || []).join(", ")));
+    const cell = el("td");
+    cell.append(descriptionEditor(`${col.column_name} tavsifi`, "column", d.schema, d.name, col.column_name));
+    tr.append(cell);
+    table.append(tr);
+  }
+  const parts = [title, descriptionEditor("Jadval tavsifi", "table", d.schema, d.name, ""), table];
+  const keys = el("ul", "cn-keys");
+  for (const k of d.constraints) {
+    const label = { primary_key: "Birlamchi kalit", unique: "Noyob", foreign_key: "Tashqi kalit" }[k.kind];
+    const target = k.kind === "foreign_key" ? ` → ${k.ref_schema}.${k.ref_object} (${k.ref_columns.join(", ")})` : "";
+    keys.append(el("li", "", `${label} ${k.constraint_name}: (${k.columns.join(", ")})${target}`));
+  }
+  if (!d.constraints.length) keys.append(el("li", "muted", "Kalit yo'q."));
+  parts.push(el("h4", "", "Kalitlar"), keys);
+  if (d.indexes.length) {
+    const indexes = el("ul", "cn-keys");
+    for (const i of d.indexes) indexes.append(el("li", "", `${i.index_name}: (${i.columns.join(", ")})${i.is_unique ? " · noyob" : ""}${i.is_primary ? " · birlamchi" : ""}`));
+    parts.push(el("h4", "", "Indekslar"), indexes);
+  }
+  box.replaceChildren(...parts);
+  syncChecks();
+}
+
+// ----- freshness, changes, selection and the context preview (roadmap M4.2) -----
+// The backend decides everything that matters here: the rules of the selection are checked again by PUT …/schema/selections and
+// the context is built by GET …/schema/context. This code only edits a list of items, shows the answers and never builds the
+// context itself. Items of the selection are sent without the "available" flag the server adds.
+const FRESH_TEXT = {
+  current: "Yangi", stale: "Eskirgan", failed: "Oxirgi aniqlash xato bilan tugadi", in_progress: "Aniqlanmoqda…", never_discovered: "Hali aniqlanmagan",
+};
+const REASON_TEXT = {
+  unreviewed_changes: "tanlangan obyektlar o'zgargan", removed_selected: "tanlangan obyekt endi yo'q", age: "uzoq vaqt tasdiqlanmagan",
+  last_discovery_failed: "oxirgi aniqlash xato bilan tugagan",
+};
+const CHANGE_HOW = { added: "qo'shildi", removed: "o'chdi", modified: "o'zgardi" };
+const CHANGE_KIND = { schema: "sxema", table: "jadval", view: "ko'rinish", column: "ustun", relationship: "tashqi kalit", constraint: "cheklov", index: "indeks" };
+
+function selItem(i) { return { kind: i.kind, schema: i.schema, object: i.object || "", column: i.column || "", mode: i.mode || "include" }; }
+function selFind(kind, schema, object, column, mode) {
+  return cnSel.items.find((i) => i.kind === kind && i.schema === schema && i.object === (object || "") && i.column === (column || "") && i.mode === mode);
+}
+function selDrop(item) { if (item) cnSel.items = cnSel.items.filter((i) => i !== item); }
+function selAdd(kind, schema, object, column, mode) {
+  if (!selFind(kind, schema, object, column, mode)) cnSel.items.push({ kind, schema, object: object || "", column: column || "", mode });
+}
+function tableWhole(schema, object) {
+  if (selFind("table", schema, object, "", "include")) return true;
+  return !!selFind("schema", schema, "", "", "include") && !selFind("table", schema, object, "", "exclude");
+}
+function tablePartial(schema, object) {
+  return !tableWhole(schema, object) && cnSel.items.some((i) => i.kind === "column" && i.schema === schema && i.object === object && i.mode === "include");
+}
+function columnChecked(schema, object, column) {
+  return tableWhole(schema, object) ? !selFind("column", schema, object, column, "exclude") : !!selFind("column", schema, object, column, "include");
+}
+
+// What the rules refuse is removed from the list before it is sent (the server refuses it as well).
+function selPrune() {
+  const keep = (i) => {
+    if (i.kind === "table" && i.mode === "exclude") return !!selFind("schema", i.schema, "", "", "include");
+    if (i.kind === "column" && i.mode === "exclude") return tableWhole(i.schema, i.object);
+    if (i.kind === "column" && i.mode === "include") return !tableWhole(i.schema, i.object) && !selFind("table", i.schema, i.object, "", "exclude");
+    return true;
+  };
+  for (let again = true; again;) {
+    const before = cnSel.items.length;
+    cnSel.items = cnSel.items.filter(keep);
+    again = cnSel.items.length !== before;
+  }
+}
+
+function selToggle(spec) {
+  const { kind, schema, object, column } = spec;
+  if (kind === "schema") {
+    const found = selFind("schema", schema, "", "", "include");
+    if (found) selDrop(found); else selAdd("schema", schema, "", "", "include");
+  } else if (kind === "table") {
+    const picked = tableWhole(schema, object) || tablePartial(schema, object);
+    const inSchema = !!selFind("schema", schema, "", "", "include");
+    cnSel.items = cnSel.items.filter((i) => !(i.schema === schema && i.object === object && (i.kind === "column" || i.kind === "table")));
+    if (picked) { if (inSchema) selAdd("table", schema, object, "", "exclude"); } else if (!inSchema) selAdd("table", schema, object, "", "include");
+  } else if (kind === "column") {
+    const mode = tableWhole(schema, object) ? "exclude" : "include";
+    const found = selFind("column", schema, object, column, mode);
+    if (found) selDrop(found); else selAdd("column", schema, object, column, mode);
+  }
+  selPrune();
+  cnSel.dirty = true;
+  syncChecks();
+  renderSelectionNote();
+}
+
+function selectionBox(label, spec) {
+  const wrap = el("label", "cn-pick");
+  const box = el("input");
+  box.type = "checkbox";
+  box.dataset.kind = spec.kind;
+  box.dataset.schema = spec.schema;
+  box.dataset.object = spec.object;
+  box.dataset.column = spec.column;
+  setAttr(box, "aria-label", label);
+  box.addEventListener("change", () => selToggle(spec));
+  wrap.append(box);
+  return wrap;
+}
+
+function syncChecks() {
+  if (!cnSel) return;
+  for (const box of document.querySelectorAll("#cn-schema input[data-kind]")) {
+    const { kind, schema, object, column } = box.dataset;
+    if (kind === "schema") {
+      box.checked = !!selFind("schema", schema, "", "", "include");
+      box.indeterminate = false;
+    } else if (kind === "table") {
+      const whole = tableWhole(schema, object);
+      box.checked = whole;
+      box.indeterminate = !whole && tablePartial(schema, object);
+    } else {
+      box.checked = columnChecked(schema, object, column);
+    }
+  }
+}
+
+function renderSelectionNote() {
+  if (!cnSel) return;
+  const count = cnSel.items.length;
+  setText($("cn-selection-note"), `${count ? `Tanlov: ${count} element.` : "Hech narsa tanlanmagan: AI kontekstida hech qanday jadval yo'q."}${cnSel.dirty ? " Saqlanmagan o'zgarish bor." : ""}`);
+  const gone = cnSel.items.filter((i) => i.available === false);
+  const list = $("cn-unavailable");
+  list.hidden = !gone.length;
+  list.replaceChildren(...gone.map((i) => {
+    const li = el("li", "", `Endi mavjud emas: ${[i.schema, i.object, i.column].filter(Boolean).join(".")} (${i.mode === "exclude" ? "chiqarib tashlash" : "qo'shish"}) `);
+    li.append(cnButton("Olib tashlash", () => { selDrop(i); cnSel.dirty = true; renderSelectionNote(); }));
+    return li;
+  }));
+}
+
+async function loadSelection() {
+  const c = cnSchema.connection;
+  const result = await cnRun(() => cnApi("GET", `/${c.id}/schema/selections`));
+  if (!result) return;
+  cnSel = { revision: result.data.revision, items: result.data.items.map((i) => ({ ...selItem(i), available: i.available })), dirty: false };
+  renderSelectionNote();
+}
+
+async function saveSelection() {
+  if (!cnSel) return;
+  const c = cnSchema.connection;
+  const result = await cnRun(() => cnApi("PUT", `/${c.id}/schema/selections`, { items: cnSel.items.map(selItem), base_revision: cnSel.revision }));
+  if (!result) return;
+  cnMessage("Tanlov saqlandi.", "ok");
+  announce("Tanlov saqlandi.");
+  await loadSelection();
+  await loadFreshness();
+  syncChecks();
+}
+
+function renderFreshness() {
+  const f = cnFresh;
+  const box = $("cn-fresh");
+  if (!f) { box.replaceChildren(); return; }
+  const head = el("div", "");
+  head.append(el("span", `cn-fresh-state ${f.state}`, `Holat: ${FRESH_TEXT[f.state] || f.state}`));
+  const lines = [head];
+  if (f.reasons.length) lines.push(el("div", "muted", `Sabab: ${f.reasons.map((r) => REASON_TEXT[r] || r).join("; ")}.`));
+  if (f.snapshot) {
+    lines.push(el("div", "muted", `Versiya ${f.snapshot.version} · barmoq izi ${f.snapshot.fingerprint.slice(0, 12)} · tasdiqlangan ${cnWhen(f.snapshot.verified_at)} · ${f.snapshot.objects} obyekt, ${f.snapshot.columns} ustun`));
+  }
+  if (f.last_error) lines.push(el("div", "update warn", `Oxirgi xato: ${cnCodeText(f.last_error)}`));
+  if (f.unreviewed_changes) lines.push(el("div", "muted", `Ko'rib chiqilmagan o'zgarishlar: ${f.unreviewed_changes} (tanlanganlarga tegishlisi: ${f.affected_selected})`));
+  if (f.orphaned_descriptions) lines.push(el("div", "muted", `Obyekti yo'q tavsiflar: ${f.orphaned_descriptions}`));
+  if (f.snapshot && f.unreviewed_changes) lines.push(cnButton("Ko'rib chiqdim", () => acknowledgeChanges(f.snapshot.version)));
+  box.replaceChildren(...lines);
+}
+
+async function loadFreshness() {
+  const c = cnSchema.connection;
+  const result = await cnRun(() => cnApi("GET", `/${c.id}/schema/freshness`));
+  if (!result) return;
+  cnFresh = result.data;
+  renderFreshness();
+}
+
+async function acknowledgeChanges(version) {
+  const c = cnSchema.connection;
+  const result = await cnRun(() => cnApi("POST", `/${c.id}/schema/changes/acknowledge`, { version }));
+  if (!result) return;
+  cnMessage("O'zgarishlar ko'rib chiqildi.", "ok");
+  announce("O'zgarishlar ko'rib chiqildi.");
+  cnFresh = result.data;
+  renderFreshness();
+  $("cn-changes").hidden = true;
+}
+
+async function showChanges() {
+  const c = cnSchema.connection;
+  const since = cnFresh ? cnFresh.confirmed_version : 0;
+  const result = await cnRun(() => cnApi("GET", `/${c.id}/schema/changes?since_version=${since}&limit=200`));
+  if (!result) return;
+  const box = $("cn-changes");
+  const list = el("ul");
+  for (const ch of result.data.changes) {
+    const name = [ch.schema_name, ch.object_name, ch.sub_name].filter(Boolean).join(".");
+    list.append(el("li", "", `v${ch.to_version}: ${CHANGE_KIND[ch.object_type] || ch.object_type} ${name} ${CHANGE_HOW[ch.change_type] || ch.change_type}`));
+  }
+  const title = el("div", "muted", result.data.total ? `Ko'rib chiqilmagan o'zgarishlar: ${result.data.total}` : "Ko'rib chiqilmagan o'zgarish yo'q.");
+  box.replaceChildren(title, list);
+  box.hidden = false;
+}
+
+function renderOrphans() {
+  const list = $("cn-orphans");
+  const orphans = cnSchema.descriptions.filter((d) => d.orphaned);
+  list.hidden = !orphans.length;
+  list.replaceChildren(...orphans.map((d) => {
+    const li = el("li", "", `Obyekti yo'q: ${[d.schema_name, d.object_name, d.column_name].filter(Boolean).join(".") || "baza"} — ${d.description} `);
+    li.append(cnButton("O'chirish", async () => { await saveDescription(d.target_kind, d.schema_name, d.object_name, d.column_name, "", null); renderOrphans(); }));
+    return li;
+  }));
+}
+
+async function showContext() {
+  const c = cnSchema.connection;
+  const result = await cnRun(() => cnApi("GET", `/${c.id}/schema/context?allow_stale=true`));
+  if (!result) return;
+  const d = result.data;
+  const box = $("cn-context");
+  const status = el("div", d.usable ? "muted" : "update warn",
+    `Holat: ${d.status} · ${d.usable ? "AI uchun yaroqli" : "AI uchun yaroqsiz"} · ${d.budget.used_chars}/${d.budget.max_chars} belgi · ${d.selection.included_objects}/${d.selection.selected_objects} obyekt${d.complete ? "" : " (hammasi sig'madi)"}`);
+  const pre = el("pre", "", JSON.stringify(d.context, null, 1)); // the backend's JSON, as it is
+  box.replaceChildren(status, pre);
+  box.hidden = false;
+}
+
+$("cn-show-changes").addEventListener("click", () => { if (cnSchema) showChanges(); });
+$("cn-save-selection").addEventListener("click", saveSelection);
+$("cn-show-context").addEventListener("click", () => { if (cnSchema) showContext(); });
+
+// ----- when the session starts and ends -----
+
+function onConnectorMode(mode) {
+  const panel = $("connections");
+  panel.hidden = mode !== "session";
+  if (mode === "session" && !cnLoaded) {
+    refreshConnections();
+  }
+  if (mode !== "session" && cnLoaded) { // signed out or expired: nothing of it stays on the page
+    cnLoaded = false;
+    cnConnections = [];
+    hideForm();
+    closeSchema();
+    $("cn-stepup").hidden = true;
+    renderConnections();
+    cnMessage("");
+  }
+}
 
 refreshDocs();
 refreshSession();

@@ -98,7 +98,12 @@ def test_the_lock_is_a_session_lock_so_a_migrator_that_dies_releases_it(three_ro
                              autocommit=True)
     assert waiter.execute("SELECT pg_try_advisory_lock(%s)", (db.MIGRATION_LOCK,)).fetchone()[0] is False
     holder.close()  # the process died, the connection went with it
-    assert waiter.execute("SELECT pg_try_advisory_lock(%s)", (db.MIGRATION_LOCK,)).fetchone()[0] is True
+    deadline, released = time.time() + 10, False
+    while time.time() < deadline and not released:  # the server notices a closed connection a moment later
+        released = waiter.execute("SELECT pg_try_advisory_lock(%s)", (db.MIGRATION_LOCK,)).fetchone()[0]
+        if not released:
+            time.sleep(0.2)
+    assert released is True
     waiter.close()
 
 

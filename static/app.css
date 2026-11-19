@@ -65,10 +65,41 @@ textarea { flex: 1; resize: none; font: inherit; color: var(--text); background:
 textarea:focus-visible { outline: 2px solid var(--accent); border-color: transparent; }
 #send { background: var(--accent); color: var(--accent-text); border-color: var(--accent); padding: 9px 18px; }
 #send:disabled { opacity: .55; cursor: default; }
+/* external database connections (M4.1b) */
+.connections { flex: 0 1 auto; max-height: 62vh; overflow: auto; margin: 0 20px 16px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.connections > summary { cursor: pointer; font-weight: 600; }
+/* a class that sets `display` must not defeat the hidden attribute (the form is a grid) */
+.connections [hidden] { display: none !important; }
+.cn-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.cn-box { margin: 10px 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.cn-form { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 8px 12px; align-items: center; }
+.cn-form h3, .cn-form .cn-actions, .cn-form .cn-check, .cn-form textarea { grid-column: 1 / -1; }
+.cn-form input:not([type="checkbox"]), .cn-form select, .cn-form textarea, .cn-box input[type="search"], .cn-desc-edit textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); width: 100%; }
+.cn-form label { font-size: 13px; }
+.cn-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.cn-item { padding: 10px 0; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; }
+.cn-head { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+.cn-status { font-size: 12px; } .cn-status.ready { color: var(--ok); } .cn-status.disabled { color: var(--muted); } .cn-status.needs_credentials { color: var(--bad); }
+.cn-desc { font-size: 13px; overflow-wrap: anywhere; }
+.cn-objects { list-style: none; margin: 4px 0; padding: 0; max-height: 220px; overflow: auto; }
+.cn-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.cn-table th, .cn-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+.cn-keys { margin: 4px 0 8px; padding-left: 18px; font-size: 13px; }
+.cn-desc-edit { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.cn-fresh { margin: 6px 0; display: flex; flex-direction: column; gap: 4px; }
+.cn-fresh-state { font-weight: 600; } .cn-fresh-state.current { color: var(--ok); } .cn-fresh-state.stale, .cn-fresh-state.failed { color: var(--bad); } .cn-fresh-state.in_progress, .cn-fresh-state.never_discovered { color: var(--muted); }
+.cn-changes ul, .cn-context pre { margin: 4px 0; padding-left: 18px; font-size: 13px; }
+.cn-context pre { padding: 8px; border: 1px solid var(--line); border-radius: 8px; max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cn-pick { display: inline-flex; gap: 4px; align-items: center; font-size: 13px; margin-right: 6px; }
+.cn-desc-edit button { align-self: flex-start; font-size: 12px; padding: 2px 8px; }
+button.primary { border-color: var(--accent); color: var(--accent); }
+.upload-msg.ok { color: var(--ok); }
 @media (max-width: 800px) {
   main { grid-template-columns: 1fr; grid-auto-rows: min-content; padding: 12px 16px; overflow-y: auto; }
   aside, .chat { flex-shrink: 0; }
   .docs { max-height: 30vh; flex: none; }
   .chat { height: 80vh; }
   .msg { max-width: 94%; }
+  .cn-form { grid-template-columns: 1fr; }
+  .connections { margin: 0 16px 12px; }
 }

@@ -41,7 +41,18 @@ SECRET_FILES = {BOOTSTRAP: "db_bootstrap_password", MIGRATOR: "db_migrator_passw
 RUNTIME_GRANTS = {"documents": ("SELECT", "INSERT", "UPDATE", "DELETE"),
                   "document_versions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
                   "principals": ("SELECT",),
-                  "schema_migrations": ("SELECT",)}
+                  "schema_migrations": ("SELECT",),
+                  # the connector's own tables (M4.1b): connections, what was discovered, and the descriptions
+                  "connections": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+                  "connection_objects": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+                  "connection_columns": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+                  "connection_constraints": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+                  "connection_indexes": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+                  "connection_descriptions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+                  # M4.2: snapshots of a discovered schema, what changed between them, what the owner selected
+                  "schema_snapshots": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+                  "schema_changes": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+                  "connection_selections": ("SELECT", "INSERT", "UPDATE", "DELETE")}
 NO_ATTRIBUTES = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
 SCRAM_ITERATIONS = 4096
 MIN_PASSWORD_LENGTH = 22  # 128 bits written in base64url

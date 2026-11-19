@@ -17,6 +17,7 @@ from rag.auth.deps import build_context as build_security
 from rag.auth.routes import install as install_auth
 from rag.auth.routes import install_discovery
 from rag.bodylimit import UploadBodyLimit
+from rag.connector_wiring import install as install_connector
 from rag.relay import Relay
 
 log = logging.getLogger(__name__)
@@ -119,6 +120,7 @@ def create_app(repo=db, security=None):
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     if security:
         install_auth(app, security)  # the connector's own routes, under /api/v1; no existing route is touched
+        install_connector(app, security)  # connections, schema discovery and descriptions (M4.1b)
     else:
         install_discovery(app)  # the one route that says the connector is off
     # Added before `guard`, so it sits inside it: the Host/Origin checks answer first, then the body is limited.

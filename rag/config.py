@@ -138,3 +138,24 @@ SECURITY_LOG_MAX_BYTES = 5 * 1024 * 1024
 SECURITY_LOG_BACKUPS = 5
 SECURITY_CHECK_TTL_S = 60  # how long the result of the security checks is reused
 SECURITY_DB_TIMEOUT_S = 5  # how long a security check waits for the database (the pool's own wait is 30 s)
+
+# External database connector (roadmap M4.1b, docs/connector.md). Inert while CONNECTOR_ENABLED is false.
+ENCRYPTION_KEY_FILE = "encryption.key"  # in SECRETS_DIR, outside PostgreSQL/backups/repo/image
+CONNECTOR_MAX_CONNECTIONS = int(os.getenv("RAG_CONNECTOR_MAX_CONNECTIONS", "50"))  # per owner
+CONNECTOR_TEST_TIMEOUT_S = float(os.getenv("RAG_CONNECTOR_TEST_TIMEOUT_S", "10"))  # one test, connecting included
+CONNECTOR_DISCOVERY_TIMEOUT_S = float(os.getenv("RAG_CONNECTOR_DISCOVERY_TIMEOUT_S", "60"))  # one whole discovery
+CONNECTOR_MAX_CONCURRENT = int(os.getenv("RAG_CONNECTOR_MAX_CONCURRENT", "4"))  # external operations at once
+CONNECTOR_MAX_OBJECTS = int(os.getenv("RAG_CONNECTOR_MAX_OBJECTS", "20000"))  # tables + views one discovery stores
+CONNECTOR_MAX_COLUMNS = int(os.getenv("RAG_CONNECTOR_MAX_COLUMNS", "300000"))
+# Optional: only these hosts may be connected to (comma separated; "*.example.org" allowed). Empty: any host that the
+# fixed rules of rag/connector/network.py do not block (link-local, unspecified, multicast, our own database).
+_ALLOWED = os.getenv("RAG_CONNECTOR_ALLOWED_HOSTS", "")
+CONNECTOR_ALLOWED_HOSTS = tuple(h.strip().lower() for h in _ALLOWED.split(",") if h.strip())
+
+# Schema snapshots and context (roadmap M4.2, docs/connector.md).
+CONNECTOR_SNAPSHOT_RETENTION = max(2, int(os.getenv("RAG_CONNECTOR_SNAPSHOT_RETENTION", "10")))  # snapshots kept
+CONNECTOR_SCHEMA_MAX_AGE_S = float(os.getenv("RAG_CONNECTOR_SCHEMA_MAX_AGE_S", str(7 * 24 * 3600)))  # older = stale
+CONNECTOR_MAX_CHANGES = int(os.getenv("RAG_CONNECTOR_MAX_CHANGES", "5000"))  # kept per snapshot
+CONNECTOR_MAX_SELECTION_ITEMS = int(os.getenv("RAG_CONNECTOR_MAX_SELECTION_ITEMS", "50000"))
+CONNECTOR_CONTEXT_MAX_CHARS = int(os.getenv("RAG_CONNECTOR_CONTEXT_MAX_CHARS", "24000"))  # the default budget
+CONNECTOR_CONTEXT_HARD_MAX_CHARS = int(os.getenv("RAG_CONNECTOR_CONTEXT_HARD_MAX_CHARS", "200000"))  # the largest ask

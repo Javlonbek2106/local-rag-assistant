@@ -23,6 +23,17 @@ from rag.auth import secretfiles
 CHECK_NAMES = frozenset({"principal_ok", "db_role_unprivileged", "db_runtime_permissions", "db_password_not_default",
                          "secrets_dir_private", "key_location_ok", "security_log_writable"})
 EVENTS = {
+    "connection_created": {"ok"},
+    "connection_updated": {"ok", "credential"},
+    "connection_deleted": {"ok"},
+    "connection_enabled": {"ok"},
+    "connection_disabled": {"ok"},
+    "connection_tested": {"ok", "failed"},
+    "schema_discovered": {"ok", "failed"},
+    "schema_selection_changed": {"ok"},
+    "schema_changes_acknowledged": {"ok"},
+    "key_created": {"ok"},
+    "key_rewrapped": {"ok"},
     "db_setup": {"ok", "failed"},
     "legacy_role_closed": {"ok"},
     "secrets_created": {"ok"},

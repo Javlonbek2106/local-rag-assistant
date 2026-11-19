@@ -13,6 +13,7 @@ Lock order everywhere: the version being changed, then its document, then the ve
 """
 import functools
 import logging
+import threading
 import uuid
 from pathlib import Path
 
@@ -73,8 +74,7 @@ class _RuntimeConnection(psycopg.Connection):
         return super().connect(conninfo, password=dbroles.read_password(dbroles.APP), **kwargs)
 
 
-@functools.lru_cache(maxsize=1)
-def pool():
+def _open_pool():
     kwargs = {"row_factory": dict_row, "autocommit": True}
     if config.DB_SCHEMA:
         kwargs["options"] = f"-c search_path={config.DB_SCHEMA}"
@@ -83,6 +83,22 @@ def pool():
         return ConnectionPool(dbroles.conninfo(dbroles.APP), connection_class=_RuntimeConnection, min_size=1,
                               max_size=config.DB_POOL_SIZE, kwargs=kwargs, open=True)
     return ConnectionPool(config.DATABASE_URL, min_size=1, max_size=config.DB_POOL_SIZE, kwargs=kwargs, open=True)
+
+
+_pool_lock = threading.Lock()
+_cached_pool = functools.lru_cache(maxsize=1)(_open_pool)
+
+
+def pool():
+    """The one connection pool. `lru_cache` alone does not lock: two threads that arrive while it is still empty would
+    each open a pool and one would leak (with its connections and threads). The lock makes the first caller open it and
+    the others wait for it."""
+    with _pool_lock:
+        return _cached_pool()
+
+
+pool.cache_info = _cached_pool.cache_info  # the callers (and the tests) that reset or inspect the cache
+pool.cache_clear = _cached_pool.cache_clear
 
 
 def close():
@@ -95,6 +111,18 @@ def runtime_url():
     """The URL of the database as the application sees it (for the backup tools); in hardened mode it includes the
     password of rag_app, in memory only."""
     return dbroles.url_with_password(dbroles.APP) if config.DB_HARDENED else config.DATABASE_URL
+
+
+def standalone_connection():
+    """A connection of the runtime role that is not part of the pool, for work that keeps a transaction open for a long
+    time (the connector's schema discovery): it must not hold one of the few pooled connections the rest of the
+    application needs. The caller closes it."""
+    kwargs = {"row_factory": dict_row, "autocommit": True, "connect_timeout": 10}
+    if config.DB_SCHEMA:
+        kwargs["options"] = f"-c search_path={config.DB_SCHEMA}"
+    if config.DB_HARDENED:
+        return _RuntimeConnection.connect(dbroles.conninfo(dbroles.APP), **kwargs)
+    return psycopg.connect(config.DATABASE_URL, **kwargs)
 
 
 def _migrator_connection():

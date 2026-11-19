@@ -57,6 +57,6 @@ Hamma xato `{"error": {"code": ...}}`; noto'g'ri, eskirgan va ishlatilgan kod bi
 ## Hali qilinmagan
 
 - PostgreSQL qattiqlashtirish **qilindi** (D-7): [postgres-hardening.md](postgres-hardening.md). Ochiq chegaralar o'sha hujjat oxirida.
-- Ulanishlar, hisob ma'lumotlari ombori, SQL (M4.1b va keyingi); step-up ni hisob ma'lumotiga qo'llash.
+- Ulanishlar, hisob ma'lumotlari ombori va step-up ni hisob ma'lumotiga qo'llash **qilindi** (M4.1b): [connector.md](connector.md). SQL yaratish va bajarish keyingi bosqichlarda.
 - Birinchi administrator da'vosi oqimi (faqat sxema shartlari bor: `principals.user_id`, `claimed_at`, noyob indeks).
 - Brauzersiz mijozlar uchun alohida kirish usuli (D-16, ochiq); pairing kodi curl bilan ham ishlaydi.

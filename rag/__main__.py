@@ -9,6 +9,7 @@ Operations (each prints its own --help):
     python -m rag backup     PostgreSQL + storage + Qdrant snapshot into one verified backup folder
     python -m rag restore    restore a backup into an EMPTY, separate environment
     python -m rag db-secrets | db-setup | db-rotate | db-check    hardened PostgreSQL roles (docs/postgres-hardening.md)
+    python -m rag connector key-init | key-rotate | rewrap | verify    credential vault (docs/connector.md)
 """
 import importlib
 import logging
@@ -28,7 +29,8 @@ def serve():
 OPERATIONS = {"reconcile": ("rag.reconcile", "main"), "backup": ("rag.backup", "main"),
               "restore": ("rag.backup", "restore_main"), "db-secrets": ("rag.dbadmin", "secrets_main"),
               "db-setup": ("rag.dbadmin", "setup_main"), "db-rotate": ("rag.dbadmin", "rotate_main"),
-              "db-check": ("rag.dbadmin", "check_main")}
+              "db-check": ("rag.dbadmin", "check_main"),
+              "connector": ("rag.connectorcli", "main")}
 
 
 def main(argv):

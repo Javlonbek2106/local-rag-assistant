@@ -19,6 +19,8 @@ ollama pull qwen2.5:7b
 
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# tashqi bazalar ulagichi uchun (ixtiyoriy, docs/connector.md):
+.\.venv\Scripts\python.exe -m pip install -r requirements-connector.txt
 
 # Tesseract til fayllari (loyiha ichidagi tessdata/ papkasiga)
 mkdir tessdata

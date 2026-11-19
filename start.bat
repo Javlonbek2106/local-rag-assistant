@@ -30,6 +30,10 @@ if errorlevel 1 (
 
 REM PostgreSQL roles (rag_bootstrap / rag_migrator / rag_app). The first run, and a run after an old database, sets them
 REM up; every later run only checks. An old database keeps all its data.
+REM The key that encrypts the passwords of external databases (only when the connector is on; never replaces a key).
+if "%RAG_CONNECTOR_ENABLED%"=="1" ".venv\Scripts\python.exe" -m rag connector key-init >nul
+if /i "%RAG_CONNECTOR_ENABLED%"=="true" ".venv\Scripts\python.exe" -m rag connector key-init >nul
+
 ".venv\Scripts\python.exe" -m rag db-check >nul 2>&1
 if errorlevel 1 (
     echo PostgreSQL rollari sozlanmoqda...
