@@ -11,6 +11,7 @@ Answers never contain a credential. Errors are {"error": {"code": ...}}: a fixed
 even a rejected body is answered without echoing what was sent (FastAPI's default 422 would repeat the password).
 """
 
+import asyncio
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -69,6 +70,10 @@ class AcknowledgeBody(_Body):
     version: int = Field(ge=-INT_MAX, le=INT_MAX)
 
 
+class GenerateBody(_Body):
+    question: str = Field(min_length=1, max_length=2000)
+
+
 class DescriptionBody(_Body):
     target_kind: str = Field(max_length=20)
     schema_name: str = Field(default="", max_length=300)
@@ -93,9 +98,15 @@ async def validation_error_response(request, error):
     return JSONResponse({"error": {"code": "invalid_request", "fields": fields}}, status_code=422, headers=NO_STORE)
 
 
-def build_router(service, principal, step_up):
+async def run_in_thread(_request, work):
+    """The default way to run the generation: in a worker thread, without a way to stop it when the client goes away.
+    rag/connector_wiring.py hands in a cancellable runner instead."""
+    return await asyncio.to_thread(work)
+
+
+def build_router(service, principal, step_up, runner=run_in_thread):
     """`principal(request)` returns an object with `.id` or raises; `step_up(request)` returns or raises. Both come from
-    rag/api.py."""
+    rag/api.py. `runner(request, work)` runs the blocking SQL generation and returns None if the client went away."""
 
     def no_store(response: Response):
         response.headers.update(NO_STORE)
@@ -234,6 +245,15 @@ def build_router(service, principal, step_up):
     ):
         return service.context(who.id, connection_id, max_chars, allow_stale)
 
+    @router.post("/{connection_id}/sql/generate")
+    async def generate_sql(connection_id: str, body: GenerateBody, request: Request, who: Owner):
+        """A PROPOSED SQL query for a question, from the selected and current schema context (M4.3). The query is not
+        checked and not run (`validation: "not_performed"`, `executed: false`); that is M4.4."""
+        outcome = await runner(request, lambda: service.generate_sql(who.id, connection_id, body.question))
+        if outcome is None:  # the client hung up: nobody is waiting for an answer
+            return Response(status_code=499)
+        return outcome
+
     @router.put("/{connection_id}/descriptions")
     def describe(connection_id: str, body: DescriptionBody, who: Owner):
         return service.describe(
@@ -262,7 +282,7 @@ def data_error_response(request, error):
     return JSONResponse({"error": {"code": "invalid_request"}}, status_code=400, headers=NO_STORE)
 
 
-def install(app, service, principal, step_up):
+def install(app, service, principal, step_up, runner=run_in_thread):
     app.add_middleware(
         ConnectorBodyLimit
     )  # bodies are bounded as they arrive, before FastAPI reads them (bodylimit.py)
@@ -270,4 +290,4 @@ def install(app, service, principal, step_up):
     app.add_exception_handler(DataError, data_error_response)
     app.add_exception_handler(ConnectorError, connector_error_response)
     app.add_exception_handler(RequestValidationError, validation_error_response)
-    app.include_router(build_router(service, principal, step_up))
+    app.include_router(build_router(service, principal, step_up, runner))

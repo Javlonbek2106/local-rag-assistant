@@ -19,6 +19,18 @@ class DriverError(Exception):
         self.code = code
 
 
+class ModelError(Exception):
+    """The language model could not produce an answer (M4.3). `code` is one of MODEL_CODES; no text of the model server
+    is kept: it can contain paths, model names and fragments of the prompt."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+MODEL_CODES = frozenset({"llm_timeout", "llm_unavailable", "llm_error", "llm_cancelled"})
+
+
 # What a connection test or a discovery can fail with (stored as `last_test_error`; the UI turns each into a sentence).
 DRIVER_CODES = frozenset(
     {

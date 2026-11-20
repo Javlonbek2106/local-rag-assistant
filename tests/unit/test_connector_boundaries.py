@@ -61,7 +61,7 @@ def test_only_the_repository_modules_touch_the_internal_database_and_the_drivers
 
 
 def test_the_document_side_does_not_import_the_connector():
-    allowed = {"api.py", "connector_wiring.py", "connectorcli.py", "dbroles.py", "dbadmin.py"}
+    allowed = {"api.py", "connector_wiring.py", "connectorcli.py", "dbroles.py", "dbadmin.py", "sqlmodel.py"}
     for path in RAG.glob("*.py"):
         if path.name in allowed:
             continue
@@ -135,3 +135,23 @@ def test_no_statement_is_built_from_a_request_value():
     assert "% (" not in source and ".format(" not in source and "+ owner" not in source
     more = (PACKAGE / "snapshots.py").read_text(encoding="utf-8")
     assert "% (" not in more and ".format(" not in more and "+ owner" not in more
+
+
+def test_sql_generation_cannot_reach_an_external_database_or_the_model_client():
+    """M4.3 generates text. The generator imports no driver, no database library and no model client, and no driver
+    has a function that could run a query: the drivers only test a connection and read the catalogue."""
+    forbidden = ("rag.connector.drivers", "psycopg", "pytds", "rag.llm", "socket", "http", "urllib", "subprocess")
+    for name in ("sqlgen.py",):
+        bad = [n for n in imports(PACKAGE / name) if starts(n, forbidden)]
+        assert not bad, f"{name} imports {bad}"
+    for path in (PACKAGE / "drivers").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        public = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")}
+        assert not {name for name in public if any(w in name for w in ("execute", "query", "run", "fetch"))}, path.name
+
+
+def test_the_service_hands_the_generator_a_model_function_and_never_imports_one():
+    source = (PACKAGE / "service.py").read_text(encoding="utf-8")
+    assert "sql_completer" in source and not [
+        n for n in imports(PACKAGE / "service.py") if starts(n, ("rag.llm", "rag.sqlmodel"))
+    ]

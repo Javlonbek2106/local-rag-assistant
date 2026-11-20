@@ -2,7 +2,7 @@
 
 Manba: [architecture-roadmap.md](architecture-roadmap.md) 6a-bo'lim, [architecture-decisions.md](architecture-decisions.md) ADR-P12…P16. Autentifikatsiya asosi: [connector-auth.md](connector-auth.md). Ichki bazani qattiqlashtirish: [postgres-hardening.md](postgres-hardening.md).
 
-Bu hujjat M4.1b va M4.2 da **nima qurilganini** va qanday ishlatilishini tasvirlaydi. M4.2 bo'limlari ["Sxema konteksti va metama'lumot (M4.2)"](#sxema-konteksti-va-metamalumot-m42) dan boshlanadi. Qurilmagan narsa oxirida alohida ro'yxatda.
+Bu hujjat M4.1b va M4.2 da **nima qurilganini** va qanday ishlatilishini tasvirlaydi. M4.2 bo'limlari ["Sxema konteksti va metama'lumot (M4.2)"](#sxema-konteksti-va-metamalumot-m42) dan boshlanadi. M4.3 (savoldan SQL **taklifi**) alohida hujjatda: [sql-generation.md](sql-generation.md). Qurilmagan narsa oxirida alohida ro'yxatda.
 
 ## Qisqacha
 
@@ -89,6 +89,7 @@ Hamma marshrut sessiya talab qiladi (tokensiz 401), egasi **faqat** sessiyadagi 
 | `GET …/{id}/schema/freshness` | yangilik holati (pastga qarang) | |
 | `GET`/`PUT …/{id}/schema/selections` | ochiq obyektlar tanlovi; `PUT {items, base_revision}`: butunligicha almashtiradi, boshqa joyda o'zgargan bo'lsa `selection_conflict` (409), mavjud bo'lmagan yangi element `object_not_found` (404), qoida buzilsa `invalid_selection` (400, `reason` bilan) | |
 | `GET …/{id}/schema/context?max_chars=&allow_stale=` | sxema konteksti (pastga qarang); yangi bo'lmasa `context_stale` (409, `reason` = holat); `allow_stale=true` bo'lsa ko'rish uchun beriladi, lekin `usable: false` | |
+| `POST …/{id}/sql/generate` `{question}` | **M4.3:** savoldan **taklif qilingan** SQL (tekshirilmaydi, bajarilmaydi); batafsil: [sql-generation.md](sql-generation.md) | |
 
 **Step-up nima uchun:** saqlangan parol boshqa serverga yo'naltirilishi mumkin emas. Sessiyani o'g'irlagan kishi `host` ni o'zgartirib parolni o'z serveriga yuborishi mumkin edi; shu sababli maqsadni o'zgartirish ham parolni o'zgartirish kabi yangi kod bilan tasdiqlanadi.
 
@@ -185,7 +186,7 @@ Ikki snapshot orasidagi farq **SQL to'plam amallari** bilan hisoblanadi (xotirad
 | `in_progress` | aniqlash hozir ketyapti (boshlanganiga `2 × CONNECTOR_DISCOVERY_TIMEOUT_S + 30` soniyadan kam bo'lsa; yiqilgan jarayon shundan keyin hisobdan chiqadi) |
 | `failed` | oxirgi urinish tugamadi; avvalgi snapshot (bo'lsa) saqlangan va o'qiladi; sabab (`last_error`) alohida |
 | `never_discovered` | snapshot ham, urinish ham yo'q |
-| `stale` | snapshot bor va oxirgi urinish yaxshi, lekin shundayligicha ishonib bo'lmaydi: (a) tanlovga tegadigan o'zgarishlar ko'rib chiqilmagan (`unreviewed_changes`), (b) tanlangan obyekt endi yo'q (`removed_selected`), (c) snapshot `CONNECTOR_SCHEMA_MAX_AGE_S` dan uzoq vaqt tasdiqlanmagan (`age`) |
+| `stale` | snapshot bor va oxirgi urinish yaxshi, lekin shundayligicha ishonib bo'lmaydi: (a) tanlovga tegadigan o'zgarishlar ko'rib chiqilmagan (`unreviewed_changes`), (b) tanlangan obyekt endi yo'q (`removed_selected`), (c) snapshot `CONNECTOR_SCHEMA_MAX_AGE_S` dan uzoq vaqt tasdiqlanmagan (`age`), (d) ulanish endi snapshot o'qilgan bazadan yoki dvigateldan boshqasiga yo'naltirilgan: `provider` yoki `database_name` o'zgargan (`target_changed`; faqat yangi aniqlash tuzatadi). `host`/`port` o'zgarishi, provayder va baza nomi bir xil qolsa, **aniqlanmaydi**: maqsadni o'zgartirgach sxemani qayta aniqlang |
 | `current` | yuqoridagilarning hech biri |
 
 `reasons` hamma amal qiladigan sabablarni beradi (muvaffaqiyatsiz aniqlashda ham ko'rib chiqilmagan o'zgarish bo'lishi mumkin). Javobda `snapshot` (id, versiya, barmoq izi, `verified_at`), `confirmed_version`, `unreviewed_changes`, `affected_selected`, `removed_selected`, `orphaned_descriptions` bor.
@@ -294,4 +295,4 @@ Tavsif aniqlangan metama'lumotdan **alohida**, **nom bo'yicha** saqlanadi. Obyek
 
 ## Qurilmagan (keyingi bosqichlar)
 
-Tabiiy tildan SQL, SQL yaratish, tahlil va bajarish, SQL tekshiruvi, natija keshi, gibrid RAG, ma'lumotni ichki bazaga yoki RAG ga kiritish, sxema uchun embedding, so'rov auditi, biznes lug'ati, **avtomatik** kalit aylantirish, ko'p foydalanuvchi, umumiy autentifikatsiya (Faza 3). Bular M4.3, M4.4 va keyingi bosqichlar; bu hujjat ularni bajarilgan deb belgilamaydi. Sxema konteksti (M4.2) tayyor, lekin uni hech narsa modelga yubormaydi.
+SQL **tekshiruvi va bajarish** (M4.4 va keyin; M4.3 faqat taklif yaratadi: [sql-generation.md](sql-generation.md)), SQL tahlili, natija keshi, gibrid RAG, ma'lumotni ichki bazaga yoki RAG ga kiritish, sxema uchun embedding, so'rov auditi, biznes lug'ati, **avtomatik** kalit aylantirish, ko'p foydalanuvchi, umumiy autentifikatsiya (Faza 3). Bular M4.4 va keyingi bosqichlar; bu hujjat ularni bajarilgan deb belgilamaydi. Sxema konteksti (M4.2) faqat M4.3 savoldan SQL taklifi uchun modelga beriladi; hech qanday SQL bajarilmaydi.

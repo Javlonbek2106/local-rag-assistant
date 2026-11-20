@@ -98,6 +98,17 @@
     </form>
     <ul id="cn-list" class="cn-list" aria-label="Ulanishlar ro'yxati"></ul>
     <p id="cn-empty" class="muted" hidden>Hozircha ulanish yo'q.</p>
+    <section id="cn-sql" class="cn-box" aria-label="Savoldan SQL taklifi" hidden>
+      <h3>Savoldan SQL taklifi</h3>
+      <p class="muted">Model faqat siz tanlagan va joriy sxemadan foydalanadi. Yaratilgan SQL <strong>tekshirilmagan</strong> va <strong>bajarilmaydi</strong>: bu faqat taklif (tekshirish va bajarish keyingi bosqichda).</p>
+      <label for="sg-connection">Ulanish</label><select id="sg-connection"></select>
+      <div id="sg-fresh" class="muted"></div>
+      <label for="sg-question">Savol (Ctrl+Enter — yaratish)</label>
+      <textarea id="sg-question" rows="3" maxlength="2000" spellcheck="false" placeholder="Masalan: oxirgi 30 kunda eng ko'p buyurtma bergan 10 mijozni ko'rsat"></textarea>
+      <div class="cn-actions"><button id="sg-generate" type="button">SQL yaratish</button><button id="sg-copy" type="button" hidden>Nusxa olish</button></div>
+      <div id="sg-error" class="upload-msg" role="alert" hidden></div>
+      <div id="sg-result" class="sg-result" aria-live="off" hidden></div>
+    </section>
     <section id="cn-schema" class="cn-box" aria-label="Sxema ko'rinishi" hidden>
       <div class="cn-head"><h3 id="cn-schema-title">Sxema</h3><button id="cn-schema-close" type="button">Yopish</button></div>
       <div id="cn-fresh" class="cn-fresh"></div>

@@ -382,7 +382,7 @@ def facts(owner, connection_id):
             "SELECT now() AS now, c.discovery_started_at, c.last_discovery_at, c.last_discovery_status, "
             "c.last_discovery_error, c.context_confirmed_version, c.selection_revision, c.schema_discovered_at, "
             "s.id AS snapshot_id, s.version, s.fingerprint, s.created_at, s.verified_at, s.objects_count, "
-            "s.columns_count "
+            "s.columns_count, s.provider AS snapshot_provider, s.database_name AS snapshot_database "
             "FROM connections c LEFT JOIN schema_snapshots s ON s.id = c.current_snapshot_id "
             "WHERE c.owner_principal_id = %s AND c.id = %s",
             (owner, connection_id),

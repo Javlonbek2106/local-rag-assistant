@@ -106,6 +106,7 @@ class ConnectionsApi(ConnectorApi):
         self.selection, self.changes, self.unavailable = [], [], set()
         self.fresh_extra = {}  # fields that replace those of the freshness answer (state, reasons, last_error ...)
         self.next_discover = None  # a list of changes the next discovery finds (then it makes a new version)
+        self.sql_answer, self.sql_failure = None, None  # M4.3: what POST .../sql/generate answers with
         self.context_extra = {}
 
     def freshness(self):
@@ -219,6 +220,11 @@ class ConnectionsApi(ConnectorApi):
                 200,
                 {"objects": 4, "columns": 8, "schema_discovered_at": "2026-11-19T05:20:00Z", "snapshot": snapshot},
             )
+        if tail == "sql/generate" and method == "POST":
+            if self.sql_failure:
+                status, code, reason = self.sql_failure
+                return self.reply(route, status, {"error": {"code": code, **({"reason": reason} if reason else {})}})
+            return self.reply(route, 200, self.sql_answer)
         if tail == "schema/freshness":
             return self.reply(route, 200, self.freshness())
         if tail == "schema/selections" and method == "GET":
@@ -943,4 +949,199 @@ def test_closing_the_schema_clears_what_it_showed_and_the_console_stays_quiet(ma
     page.locator("#cn-context pre").wait_for()
     page.locator("#cn-schema-close").click()
     assert page.locator("#cn-context").is_hidden() and page.locator("#cn-fresh").inner_text() == ""
+    assert not [c for c in make.consoles[quiet_from:] if c[0] == "error"]
+
+
+# ---------- M4.3: a SQL proposal from a question ----------
+
+SQL_ANSWER = {
+    "request_id": "r1",
+    "connection_id": "11111111-1111-1111-1111-111111111111",
+    "provider": "postgresql",
+    "dialect": "PostgreSQL",
+    "status": "generated",
+    "sql": "SELECT c.id, c.name\nFROM sales.customer c\nLIMIT 10",
+    "explanation": "The ten first customers.",
+    "assumptions": ["customer.id is the key"],
+    "ambiguities": [],
+    "validation": "not_performed",
+    "executed": False,
+    "model": "qwen-test",
+    "prompt": {"template_version": 1, "chars": 4000},
+    "context": {
+        "state": "current",
+        "snapshot_version": 3,
+        "included_objects": 2,
+        "selected_objects": 2,
+        "complete": True,
+        "omitted_objects": 0,
+    },
+    "duration_ms": 1234,
+}
+
+
+def generate_in_page(page, question="Top 10 customers"):
+    page.locator("#sg-question").fill(question)
+    page.locator("#sg-generate").click()
+
+
+def test_the_proposal_section_is_there_only_while_a_connection_is_enabled(make):
+    page, api, _ = make(listed())
+    page.locator("#cn-sql").wait_for(state="visible")
+    assert page.locator("#sg-connection option").count() == 1
+    page.get_by_role("button", name="O'chirib qo'yish").click()
+    page.wait_for_function("document.getElementById('cn-sql').hidden")
+
+
+def test_a_question_gets_a_proposed_query_shown_as_text_with_the_warning_and_the_context_it_used(make):
+    page, api, _ = make(listed())
+    api.sql_answer = SQL_ANSWER
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
+    assert page.locator("#sg-sql").inner_text() == SQL_ANSWER["sql"]
+    text = page.locator("#sg-result").inner_text()
+    assert "SQL taklif qilindi" in text and "PostgreSQL" in text and "qwen-test" in text
+    assert "tekshirilmagan va hech qachon bajarilmaydi" in text
+    assert "The ten first customers." in text and "customer.id is the key" in text
+    assert "versiya 3" in text and "2/2 obyekt" in text and "sig'madi" not in text
+    sent = [b for m, p, b in api.body_seen if p.endswith("/sql/generate")]
+    assert sent == [{"question": "Top 10 customers"}]
+    assert page.locator("#sg-copy").is_visible() and page.get_by_role("button", name="Bajar").count() == 0
+
+
+def test_a_proposal_with_hostile_text_is_only_text(make):
+    page, api, _ = make(listed())
+    api.sql_answer = {**SQL_ANSWER, "sql": f"SELECT '{HOSTILE}'", "explanation": HOSTILE, "assumptions": [HOSTILE]}
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
+    assert page.locator("#sg-result img").count() == 0 and page.evaluate("window.pwned") is None
+    assert HOSTILE in page.locator("#sg-sql").inner_text()
+
+
+def test_the_copy_button_puts_the_sql_on_the_clipboard(make):
+    page, api, context = make(listed())
+    context.grant_permissions(["clipboard-read", "clipboard-write"])
+    api.sql_answer = SQL_ANSWER
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
+    page.locator("#sg-copy").click()
+    page.wait_for_function("document.getElementById('sg-copy').textContent === 'Nusxalandi'")
+    copied = page.evaluate("navigator.clipboard.readText()")
+    assert copied.replace("\r\n", "\n") == SQL_ANSWER["sql"]  # (Windows puts CR LF on the clipboard)
+
+
+def test_a_model_that_asks_for_clarification_is_shown_as_that_and_has_no_sql_or_copy_button(make):
+    page, api, _ = make(listed())
+    api.sql_answer = {**SQL_ANSWER, "status": "needs_clarification", "sql": None, "ambiguities": ["what is active?"]}
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-result").wait_for(state="visible")
+    text = page.locator("#sg-result").inner_text()
+    assert "Model aniqlik so'radi" in text and "what is active?" in text
+    assert page.locator("#sg-sql").count() == 0 and page.locator("#sg-copy").is_hidden()
+
+
+def test_a_context_cut_to_the_budget_says_how_much_the_model_did_not_see(make):
+    page, api, _ = make(listed())
+    cut = {**SQL_ANSWER["context"], "complete": False, "omitted_objects": 7}
+    cut.update(included_objects=5, selected_objects=12)
+    api.sql_answer = {**SQL_ANSWER, "context": cut}
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
+    text = page.locator("#sg-result").inner_text()
+    assert "5/12 obyekt" in text and "7 obyekt sig'madi" in text
+
+
+@pytest.mark.parametrize(
+    "status,code,reason,expected",
+    [
+        (409, "context_stale", "stale", "Sxema konteksti hozir yangi emas. Sxema eskirgan."),
+        (409, "context_empty", None, "Hech narsa tanlanmagan"),
+        (504, "generation_timeout", "llm_timeout", "Model vaqtida javob bermadi."),
+        (503, "generation_unavailable", "llm_unavailable", "Model serveri (Ollama) ishlamayapti."),
+        (502, "malformed_model_output", "not_json", "Model javobini o'qib bo'lmadi"),
+        (413, "prompt_too_large", None, "modelga sig'maydi"),
+    ],
+)
+def test_an_error_is_shown_beside_the_form_in_words_and_no_result_is_left_behind(make, status, code, reason, expected):
+    page, api, _ = make(listed())
+    api.sql_failure = (status, code, reason)
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-error").wait_for(state="visible")
+    assert expected in page.locator("#sg-error").inner_text()
+    assert page.locator("#sg-result").is_hidden() and page.locator("#sg-generate").is_enabled()
+
+
+def test_a_stale_error_refreshes_the_freshness_line(make):
+    page, api, _ = make(listed())
+    change = {"object_type": "table", "schema_name": "sales", "object_name": "x", "sub_name": ""}
+    change["change_type"] = "added"
+    api.changes = [{**change, "to_version": 2}]
+    api.version, api.confirmed_version = 2, 1
+    api.sql_failure = (409, "context_stale", "stale")
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-error").wait_for(state="visible")
+    page.wait_for_function("document.getElementById('sg-fresh').textContent.includes('Eskirgan')")
+
+
+def test_an_empty_question_is_refused_on_the_page_without_a_request(make):
+    page, api, _ = make(listed())
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page, "   ")
+    assert "Savolni yozing" in page.locator("#sg-error").inner_text()
+    assert not [1 for m, p, b in api.body_seen if p.endswith("/sql/generate")]
+
+
+def test_ctrl_enter_generates_and_the_button_is_busy_meanwhile(make):
+    page, api, _ = make(listed())
+    api.sql_answer = SQL_ANSWER
+    page.locator("#cn-sql").wait_for(state="visible")
+    page.locator("#sg-question").fill("q")
+    page.locator("#sg-question").press("Control+Enter")
+    page.locator("#sg-sql").wait_for()
+    assert page.locator("#sg-generate").is_enabled() and page.locator("#sg-generate").inner_text() == "SQL yaratish"
+
+
+def test_choosing_another_connection_clears_the_previous_proposal(make):
+    other = connection(id="33333333-3333-3333-3333-333333333333", name="Second")
+    page, api, _ = make(ConnectionsApi([connection(), other]))
+    api.sql_answer = SQL_ANSWER
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
+    page.locator("#sg-connection").select_option(label="Second (PostgreSQL)")
+    page.wait_for_function("document.getElementById('sg-result').hidden")
+    assert page.locator("#sg-copy").is_hidden()
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
+    asked = [p for m, p, b in api.body_seen if p.endswith("/sql/generate")]
+    assert asked[-1].startswith("/api/v1/connections/33333333")
+
+
+def test_signing_out_removes_the_section_and_the_proposal(make):
+    page, api, _ = make(listed())
+    api.sql_answer = SQL_ANSWER
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
+    api.signed_in, api.expired = False, True
+    api.fail = (401, "unauthenticated")
+    page.get_by_role("button", name="Sinash").click()
+    page.locator("#pair-box").wait_for(state="visible")
+    assert page.locator("#cn-sql").is_hidden() and page.locator("#sg-result").inner_text() == ""
+
+
+def test_the_proposal_flow_keeps_the_console_quiet(make):
+    page, api, _ = make(listed())
+    quiet_from = len(make.consoles)
+    api.sql_answer = SQL_ANSWER
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
     assert not [c for c in make.consoles[quiet_from:] if c[0] == "error"]

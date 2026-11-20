@@ -11,19 +11,32 @@ recorded first and done after; a new connection is made and then recorded, and r
 test or a discovery (which changes no configuration) is recorded with its outcome.
 """
 
+import datetime
+import logging
 import re
 import threading
+import time
 import uuid
 
 from rag import config
 from rag.connector import context as context_builder
 from rag.connector import freshness as freshness_model
-from rag.connector import network, repository, selection, validation
+from rag.connector import network, repository, selection, sqlgen, validation
 from rag.connector import snapshots as snap
 from rag.connector.drivers import Target as DriverTarget
 from rag.connector.drivers import driver as load_driver
-from rag.connector.errors import DRIVER_CODES, WARNING_CODES, ConnectorError, DriverError
+from rag.connector.errors import DRIVER_CODES, WARNING_CODES, ConnectorError, DriverError, ModelError
 from rag.connector.vault import Vault, VaultError
+
+log = logging.getLogger(__name__)
+
+# How a failure of the model is answered: (code, HTTP status). The text of the model server is never passed on.
+MODEL_FAILURES = {
+    "llm_timeout": ("generation_timeout", 504),
+    "llm_unavailable": ("generation_unavailable", 503),
+    "llm_error": ("generation_failed", 502),
+    "llm_cancelled": ("generation_cancelled", 499),
+}
 
 # What a person may change about WHERE the credential goes. Changing any of it, or the password, needs a fresh step-up
 # confirmation: otherwise a stolen session could point the stored credential at a server of its own.
@@ -44,8 +57,22 @@ def needs_step_up(changes):
 
 
 class Service:
-    def __init__(self, vault: Vault, events, resolver=None, internal=None, driver_lookup=load_driver):
+    def __init__(
+        self,
+        vault: Vault,
+        events,
+        resolver=None,
+        internal=None,
+        driver_lookup=load_driver,
+        sql_completer=None,
+        clock=None,
+    ):
+        # `sql_completer(messages) -> sqlgen.Completion` is the language model (rag/sqlmodel.py gives it); without one,
+        # generation answers `generation_unavailable`. The connector package imports no model code itself.
         self._vault, self._events = vault, events
+        self._sql_completer = sql_completer
+        self._today = clock or (lambda: datetime.datetime.now(datetime.timezone.utc).date())
+        self._sql_slots = threading.BoundedSemaphore(max(1, config.SQL_MAX_CONCURRENT))
         self._network = {key: value for key, value in (("resolver", resolver), ("internal", internal)) if value}
         self._driver = driver_lookup
         self._slots = threading.BoundedSemaphore(max(1, config.CONNECTOR_MAX_CONCURRENT))
@@ -398,6 +425,8 @@ class Service:
             affected_selected=affected,
             removed_selected=gone,
             orphaned_descriptions=orphaned,
+            target_changed=has_snapshot
+            and (facts["snapshot_provider"], facts["snapshot_database"]) != (row["provider"], row["database_name"]),
         )
         snapshot = None
         if has_snapshot:
@@ -509,6 +538,107 @@ class Service:
             revision=revision,
             unavailable=self._availability(owner, connection_id, chosen) if snapshot else (),
         )
+
+    # ----- natural language -> SQL (M4.3): a PROPOSED query; nothing is validated, nothing is run -----
+
+    def generate_sql(self, owner, connection_id, question):
+        """Turn a question into a proposed SQL query using only the selected, current schema context of this connection.
+
+        The result is TEXT: it has not been checked (no parsing, no check that the tables and columns exist, no check
+        that it is a SELECT: M4.4) and it is never executed; the external database is not contacted at all (the schema
+        comes from the snapshot in the internal database). The order matters: the owner and the connection are proved
+        first (404 for anything else), then the context must be usable, and only then is the model asked."""
+        question = self._question(question)
+        row = self._row(owner, connection_id)
+        if not row["is_enabled"]:
+            raise ConnectorError("connection_disabled", 409)
+        if self._sql_completer is None:
+            raise ConnectorError("generation_unavailable", 503, reason="not_configured")
+        dialect = sqlgen.dialect_of(row["provider"])
+        today = self._today()
+        budget = sqlgen.context_budget(row["provider"], today, question)
+        if not self._sql_slots.acquire(blocking=False):
+            raise ConnectorError("busy", 429)
+        request_id = str(uuid.uuid4())
+        started = time.monotonic()
+        try:
+            shown = self.context(owner, connection_id, max_chars=budget)  # stale or missing: context_stale (409)
+            if shown["status"] == "empty":
+                raise ConnectorError("context_empty", 409)
+            if not shown["usable"]:
+                raise ConnectorError("context_unusable", 409, reason=shown["status"])
+            msgs = sqlgen.messages(row["provider"], today, question, sqlgen.schema_json(shown["context"]))
+            sqlgen.check_prompt(msgs)
+            try:
+                completion = self._sql_completer(msgs)
+            except ModelError as failure:
+                code, status = MODEL_FAILURES[failure.code]
+                raise ConnectorError(code, status, reason=failure.code) from None
+            except ConnectorError:
+                raise
+            except Exception as failure:  # noqa: BLE001 - nothing of the model's own text goes on: only a fixed code
+                log.warning("sql generation: the model call failed unexpectedly (%s)", type(failure).__name__)
+                raise ConnectorError("generation_failed", 502, reason="llm_error") from None
+            if completion.truncated:
+                raise ConnectorError("model_output_truncated", 502)
+            answer = sqlgen.parse(completion.text)
+        except ConnectorError as refused:
+            log.warning(
+                "sql generation refused: request=%s connection=%s code=%s", request_id, connection_id, refused.code
+            )
+            raise
+        finally:
+            self._sql_slots.release()
+        elapsed = int((time.monotonic() - started) * 1000)
+        chars = sqlgen.prompt_chars(msgs)
+        log.info(
+            "sql generation: request=%s connection=%s status=%s prompt_chars=%d ms=%d",
+            request_id,
+            connection_id,
+            answer["status"],
+            chars,
+            elapsed,
+        )
+        selected, spent, snapshot, fresh = shown["selection"], shown["budget"], shown["snapshot"], shown["freshness"]
+        return {
+            "request_id": request_id,
+            "connection_id": str(connection_id),
+            "provider": row["provider"],
+            "dialect": dialect,
+            **answer,
+            # what the caller must not overlook: the model saw only part of the selected schema
+            "warnings": [] if shown["complete"] else ["context_incomplete"],
+            "validation": "not_performed",  # M4.3 does not check the query: the caller must not treat it as checked
+            "executed": False,  # and nothing runs it
+            "model": completion.model,
+            "prompt": {"template_version": sqlgen.TEMPLATE_VERSION, "chars": chars},
+            "context": {
+                "state": fresh["state"],
+                "snapshot_version": snapshot["version"] if snapshot else None,
+                "snapshot_verified_at": snapshot["verified_at"] if snapshot else None,
+                "fingerprint": snapshot["fingerprint"] if snapshot else None,
+                "selected_objects": selected["selected_objects"],
+                "included_objects": selected["included_objects"],
+                "complete": shown["complete"],
+                "omitted_objects": shown["context"]["omitted"]["count"],
+                "max_chars": spent["max_chars"],
+                "used_chars": spent["used_chars"],
+                "context_fingerprint": spent["context_fingerprint"],
+            },
+            "duration_ms": elapsed,
+        }
+
+    def _question(self, question):
+        if not isinstance(question, str):
+            raise ConnectorError("invalid_question", 400, reason="not_text")
+        text = question.strip()
+        if not text:
+            raise ConnectorError("invalid_question", 400, reason="empty")
+        if len(text) > sqlgen.QUESTION_MAX_CHARS:
+            raise ConnectorError("invalid_question", 400, reason="too_long")
+        if "\x00" in text:
+            raise ConnectorError("invalid_question", 400, reason="bad_characters")
+        return text
 
     # ----- helpers -----
 

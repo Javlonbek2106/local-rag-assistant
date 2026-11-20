@@ -7,7 +7,8 @@ States, in this order of precedence:
 - `never_discovered` there is no snapshot and no attempt;
 - `stale`            a snapshot exists and the last attempt worked, but it cannot be trusted as it stands: the schema
   changed in a way that touches what is selected and nobody has reviewed it, or a selected object has disappeared, or
-  the snapshot was last confirmed longer ago than `max_age_s`;
+  the snapshot was last confirmed longer ago than `max_age_s`, or the connection now points to another database or
+  another engine than the one the snapshot was read from (`target_changed`: only a new discovery makes it current);
 - `current`          none of the above.
 `reasons` lists every cause that applies (a failed discovery can also have unreviewed changes). Nothing here decides
 what a caller may do with a state: context.py says "not usable" for everything but `current`."""
@@ -34,6 +35,7 @@ def compute(
     affected_selected=0,
     removed_selected=0,
     orphaned_descriptions=0,
+    target_changed=False,
 ):
     running = discovery_started_at is not None and seconds_between(now, discovery_started_at) < lease_s
     age = seconds_between(now, verified_at) if has_snapshot and verified_at is not None else None
@@ -47,6 +49,8 @@ def compute(
             reasons.append("removed_selected")
         if age is not None and age > max_age_s:
             reasons.append("age")
+        if target_changed:
+            reasons.append("target_changed")
     if running:
         state = IN_PROGRESS
     elif last_status == "failed":

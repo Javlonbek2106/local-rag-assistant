@@ -159,3 +159,14 @@ CONNECTOR_MAX_CHANGES = int(os.getenv("RAG_CONNECTOR_MAX_CHANGES", "5000"))  # k
 CONNECTOR_MAX_SELECTION_ITEMS = int(os.getenv("RAG_CONNECTOR_MAX_SELECTION_ITEMS", "50000"))
 CONNECTOR_CONTEXT_MAX_CHARS = int(os.getenv("RAG_CONNECTOR_CONTEXT_MAX_CHARS", "24000"))  # the default budget
 CONNECTOR_CONTEXT_HARD_MAX_CHARS = int(os.getenv("RAG_CONNECTOR_CONTEXT_HARD_MAX_CHARS", "200000"))  # the largest ask
+
+# Natural language -> SQL (roadmap M4.3, docs/sql-generation.md). Generation only: nothing here runs SQL.
+# The model is served by the same Ollama as the answers; an empty RAG_SQL_MODEL means "the answer model" (LLM_MODEL).
+SQL_MODEL = os.getenv("RAG_SQL_MODEL", "") or LLM_MODEL
+SQL_NUM_CTX = int(os.getenv("RAG_SQL_NUM_CTX", str(LLM_NUM_CTX)))  # the model's context window for one generation
+SQL_NUM_PREDICT = int(os.getenv("RAG_SQL_NUM_PREDICT", "768"))  # the most tokens one generated answer may have
+SQL_CONTEXT_MAX_CHARS = int(os.getenv("RAG_SQL_CONTEXT_MAX_CHARS", "12000"))  # the schema part of the prompt, at most
+SQL_PROMPT_MAX_CHARS = int(os.getenv("RAG_SQL_PROMPT_MAX_CHARS", "16000"))  # the whole prompt, rules included
+SQL_MAX_OUTPUT_CHARS = int(os.getenv("RAG_SQL_MAX_OUTPUT_CHARS", "8000"))  # a longer generated query is refused
+SQL_MAX_CONCURRENT = int(os.getenv("RAG_SQL_MAX_CONCURRENT", "2"))  # generations at once (the model does one at a time)
+SQL_CHARS_PER_TOKEN = float(os.getenv("RAG_SQL_CHARS_PER_TOKEN", "2.5"))  # cautious: prompt + answer must fit
