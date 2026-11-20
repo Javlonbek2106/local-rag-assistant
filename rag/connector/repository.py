@@ -412,9 +412,15 @@ def schema_replacement(owner, connection_id, max_objects, max_columns):
                 }
             if unchanged:  # outside the savepoint, which was rolled back: this is kept
                 conn.execute(
-                    "UPDATE schema_snapshots SET verified_at = now(), fingerprint = %s, fingerprint_version = %s "
-                    "WHERE id = %s",
-                    (writer.result["fingerprint"], schema_model.FINGERPRINT_VERSION, previous["id"]),
+                    "UPDATE schema_snapshots SET verified_at = now(), fingerprint = %s, fingerprint_version = %s, "
+                    "provider = %s, database_name = %s WHERE id = %s",  # the same structure, now seen at THIS target
+                    (
+                        writer.result["fingerprint"],
+                        schema_model.FINGERPRINT_VERSION,
+                        owned["provider"],
+                        owned["database_name"],
+                        previous["id"],
+                    ),
                 )
             else:
                 snapshots.prune(conn, connection_id)

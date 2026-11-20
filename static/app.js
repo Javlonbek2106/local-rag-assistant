@@ -772,12 +772,12 @@ async function cnApi(method, path, body) {
 }
 
 // Runs an action; 401 ends the session, 403 step_up_required asks for a fresh code and runs the action again afterwards.
-async function cnRun(action) {
+async function cnRun(action, report = cnMessage) {
   let result;
   try {
     result = await action();
   } catch {
-    cnMessage("Server bilan aloqa yo'q.");
+    report("Server bilan aloqa yo'q.");
     return null;
   }
   const code = result.data && result.data.error ? result.data.error.code : null;
@@ -795,7 +795,7 @@ async function cnRun(action) {
     return null;
   }
   if (result.status >= 400) {
-    cnMessage(cnCodeText(code, result.data && result.data.error ? result.data.error.reason : null));
+    report(cnCodeText(code, result.data && result.data.error ? result.data.error.reason : null));
     return null;
   }
   return result;
@@ -917,6 +917,7 @@ function renderConnections() {
   const list = $("cn-list");
   list.replaceChildren(...cnConnections.map(connectionRow));
   $("cn-empty").hidden = cnConnections.length > 0;
+  sgRender();
 }
 
 async function testConnection(c) {
@@ -1246,7 +1247,7 @@ const FRESH_TEXT = {
 };
 const REASON_TEXT = {
   unreviewed_changes: "tanlangan obyektlar o'zgargan", removed_selected: "tanlangan obyekt endi yo'q", age: "uzoq vaqt tasdiqlanmagan",
-  last_discovery_failed: "oxirgi aniqlash xato bilan tugagan",
+  last_discovery_failed: "oxirgi aniqlash xato bilan tugagan", target_changed: "ulanish boshqa bazaga yo'naltirilgan: sxemani qayta aniqlang",
 };
 const CHANGE_HOW = { added: "qo'shildi", removed: "o'chdi", modified: "o'zgardi" };
 const CHANGE_KIND = { schema: "sxema", table: "jadval", view: "ko'rinish", column: "ustun", relationship: "tashqi kalit", constraint: "cheklov", index: "indeks" };
@@ -1451,6 +1452,151 @@ async function showContext() {
 $("cn-show-changes").addEventListener("click", () => { if (cnSchema) showChanges(); });
 $("cn-save-selection").addEventListener("click", saveSelection);
 $("cn-show-context").addEventListener("click", () => { if (cnSchema) showContext(); });
+
+// ----- SQL proposals from a question (roadmap M4.3, docs/sql-generation.md) -----
+// The backend does everything that matters (the schema context, the prompt, the model, the reading of its answer); this code
+// sends a question and shows the answer as TEXT (textContent). The proposed SQL is NOT checked and is NEVER run by the
+// application: the page says so wherever the SQL is shown, and offers no way to run it.
+const SG_TEXT = {
+  invalid_question: "Savol yaroqsiz.", context_empty: "Hech narsa tanlanmagan: avval sxema oynasida jadvallarni tanlang va saqlang.",
+  context_unusable: "Tanlangan sxema kontekstga sig'madi.", generation_unavailable: "SQL yaratish hozir ishlamayapti.",
+  generation_timeout: "Model vaqtida javob bermadi.", generation_failed: "Model xato qildi.", generation_cancelled: "Bekor qilindi.",
+  generation_unsupported: "Bu baza turi uchun SQL yaratib bo'lmaydi.", empty_model_output: "Model bo'sh javob berdi.",
+  malformed_model_output: "Model javobini o'qib bo'lmadi (kutilgan shakl emas).", model_output_truncated: "Model javobi yarim qoldi (chegaraga yetdi).",
+  model_output_too_large: "Model juda uzun so'rov yozdi.", prompt_too_large: "Savol va sxema modelga sig'maydi.",
+  llm_unavailable: "Model serveri (Ollama) ishlamayapti.", llm_timeout: "Model juda sekin.", llm_error: "Model xatosi.",
+  not_configured: "Model sozlanmagan.", budget_too_small: "Hech bir obyekt sig'madi.", empty: "Savol bo'sh.", too_long: "Savol juda uzun.",
+  bad_characters: "Savolda yaroqsiz belgi bor.", not_text: "Savol matn emas.", not_json: "JSON emas.", not_an_object: "JSON obyekt emas.",
+  bad_field: "Maydon turi noto'g'ri.",
+};
+Object.assign(CN_TEXT, SG_TEXT);
+let sgBusy = false;
+
+function sgError(text) {
+  const box = $("sg-error");
+  box.hidden = !text;
+  setText(box, text || "");
+}
+
+function sgReset() {
+  $("sg-result").hidden = true;
+  $("sg-result").replaceChildren();
+  $("sg-copy").hidden = true;
+  sgError("");
+}
+
+function sgSelected() {
+  return $("sg-connection").value;
+}
+
+function sgRender() {
+  const select = $("sg-connection");
+  const usable = cnConnections.filter((c) => c.is_enabled);
+  const previous = select.value;
+  select.replaceChildren(...usable.map((c) => {
+    const option = el("option", "", `${c.name} (${CN_PROVIDER[c.provider] || c.provider})`);
+    option.value = c.id;
+    return option;
+  }));
+  if (usable.some((c) => c.id === previous)) select.value = previous;
+  $("cn-sql").hidden = !usable.length;
+  if (!usable.length) { sgReset(); setText($("sg-fresh"), ""); return; }
+  if (select.value !== previous) { sgReset(); sgFreshness(); }
+}
+
+async function sgFreshness() {
+  const id = sgSelected();
+  if (!id) return;
+  const result = await cnRun(() => cnApi("GET", `/${id}/schema/freshness`), () => {});
+  if (!result || id !== sgSelected()) return;
+  const f = result.data;
+  const version = f.snapshot ? `, versiya ${f.snapshot.version}` : "";
+  const reasons = f.reasons.length ? ` (${f.reasons.map((r) => REASON_TEXT[r] || r).join("; ")})` : "";
+  setText($("sg-fresh"), `Sxema holati: ${FRESH_TEXT[f.state] || f.state}${version}${reasons}.`);
+  setClass($("sg-fresh"), f.state === "current" ? "muted" : "update warn");
+}
+
+function sgList(title, items) {
+  if (!items.length) return null;
+  const box = el("div", "");
+  box.append(el("strong", "", title));
+  const list = el("ul", "cn-keys");
+  for (const item of items) list.append(el("li", "", item));
+  box.append(list);
+  return box;
+}
+
+function sgShow(d) {
+  const parts = [];
+  const proposed = d.status === "generated";
+  parts.push(el("div", proposed ? "muted" : "update warn",
+    `${proposed ? "SQL taklif qilindi" : "Model aniqlik so'radi"} · ${d.dialect} · model ${d.model} · ${d.duration_ms} ms`));
+  parts.push(el("div", "update warn", "Bu SQL tekshirilmagan va hech qachon bajarilmaydi: faqat taklif. Ishlatishdan oldin o'zingiz tekshiring."));
+  if (d.sql) {
+    const pre = el("pre", "sg-sql", d.sql);
+    pre.id = "sg-sql";
+    parts.push(pre);
+  }
+  if (d.explanation) parts.push(el("p", "", d.explanation));
+  for (const block of [sgList("Taxminlar", d.assumptions), sgList("Aniqlanmagan joylar", d.ambiguities)]) if (block) parts.push(block);
+  const c = d.context;
+  let note = `Sxema: versiya ${c.snapshot_version}, ${FRESH_TEXT[c.state] || c.state}, ${c.included_objects}/${c.selected_objects} obyekt modelga berildi`;
+  if (!c.complete) note += `; ${c.omitted_objects} obyekt sig'madi, shuning uchun modelga ko'rinmadi`;
+  parts.push(el("div", c.complete ? "muted" : "update warn", `${note}.`));
+  $("sg-result").replaceChildren(...parts);
+  $("sg-result").hidden = false;
+  $("sg-copy").hidden = !d.sql;
+}
+
+async function sgGenerate() {
+  if (sgBusy) return;
+  const id = sgSelected();
+  const question = $("sg-question").value.trim();
+  sgReset();
+  if (!id) return;
+  if (!question) { sgError("Savolni yozing."); $("sg-question").focus(); return; }
+  sgBusy = true;
+  $("sg-generate").disabled = true;
+  setText($("sg-generate"), "Yaratilmoqda…");
+  announce("SQL yaratilmoqda");
+  try {
+    const result = await cnRun(() => cnApi("POST", `/${id}/sql/generate`, { question }), sgError);
+    if (id !== sgSelected()) return; // the person chose another connection meanwhile: the answer is not for the page any more
+    if (result) { sgShow(result.data); announce("SQL taklifi tayyor"); } else { await sgFreshness(); }
+  } finally {
+    sgBusy = false;
+    $("sg-generate").disabled = false;
+    setText($("sg-generate"), "SQL yaratish");
+  }
+}
+
+async function sgCopy() {
+  const text = $("sg-sql") ? $("sg-sql").textContent : "";
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const range = document.createRange(); // no clipboard permission: select the text so that Ctrl+C works
+    range.selectNodeContents($("sg-sql"));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    sgError("Nusxa olib bo'lmadi: matn belgilandi, Ctrl+C bosing.");
+    return;
+  }
+  sgError("");
+  announce("SQL nusxalandi");
+  const button = $("sg-copy");
+  setText(button, "Nusxalandi");
+  setTimeout(() => setText(button, "Nusxa olish"), 1500);
+}
+
+$("sg-generate").addEventListener("click", sgGenerate);
+$("sg-copy").addEventListener("click", sgCopy);
+$("sg-connection").addEventListener("change", () => { sgReset(); sgFreshness(); });
+$("sg-question").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); sgGenerate(); }
+});
 
 // ----- when the session starts and ends -----
 

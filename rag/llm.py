@@ -116,6 +116,11 @@ def _scope():
     return getattr(_bound, "scope", None)
 
 
+def current_scope():
+    """The scope bound to this thread, or None (for callers that must read `truncated` after a call)."""
+    return _scope()
+
+
 # ---------- one HTTP call ----------
 
 def _connect(timeout):
@@ -241,14 +246,21 @@ def embed(texts):
     return vectors
 
 
-def chat_stream(messages):
+def chat_stream(messages, *, model=None, num_ctx=None, num_predict=None, response_format=None):
     """Yield the answer text piece by piece.
 
     Ends when the model finishes or reaches the output limit (then the bound scope's `truncated` is set). Closing the
     generator, or cancelling the bound scope, closes the connection, which makes Ollama stop generating.
+
+    The keyword arguments are for callers that are not the question answerer (the SQL generator of M4.3 uses another
+    model, window and output limit, and asks for JSON): left out, the answer settings apply exactly as before.
     """
-    payload = {"model": config.LLM_MODEL, "messages": messages, "stream": True, "keep_alive": config.OLLAMA_KEEP_ALIVE,
-               "options": {"temperature": 0, "num_ctx": config.LLM_NUM_CTX, "num_predict": config.LLM_NUM_PREDICT}}
+    payload = {"model": model or config.LLM_MODEL, "messages": messages, "stream": True,
+               "keep_alive": config.OLLAMA_KEEP_ALIVE,
+               "options": {"temperature": 0, "num_ctx": num_ctx or config.LLM_NUM_CTX,
+                           "num_predict": num_predict or config.LLM_NUM_PREDICT}}
+    if response_format:
+        payload["format"] = response_format
     scope = _scope()
     started = time.monotonic()
     # Ollama starts its response with the first token, so this is also the first-token wait
