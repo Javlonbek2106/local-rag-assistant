@@ -6,9 +6,9 @@ turned into a code at the border (drivers) and is never kept, logged or shown.""
 class ConnectorError(Exception):
     """A request the connector refuses or cannot complete. `status` is the HTTP status the API answers with."""
 
-    def __init__(self, code, status=400, reason=None):
+    def __init__(self, code, status=400, reason=None, details=None):
         super().__init__(code)
-        self.code, self.status, self.reason = code, status, reason
+        self.code, self.status, self.reason, self.details = code, status, reason, details
 
 
 class DriverError(Exception):
@@ -41,6 +41,9 @@ DRIVER_CODES = frozenset(
         "tls_failed",  # encryption could not be set up or the certificate is not accepted
         "permission_denied",  # the account may not read the metadata it was asked for
         "too_large",  # more objects or columns than the limits allow
+        "account_can_write",  # M4.4: a query is only run with an account that cannot change anything
+        "query_error",  # M4.4: the database refused the query itself (a value, a type, a name, a syntax)
+        "cancelled",  # M4.4: the caller went away and the query was stopped
         "driver_missing",  # the optional driver library is not installed
         "failed",  # anything else (no detail is kept)
     }

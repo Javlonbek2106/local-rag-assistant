@@ -12,6 +12,7 @@ test or a discovery (which changes no configuration) is recorded with its outcom
 """
 
 import datetime
+import hashlib
 import logging
 import re
 import threading
@@ -21,8 +22,9 @@ import uuid
 from rag import config
 from rag.connector import context as context_builder
 from rag.connector import freshness as freshness_model
-from rag.connector import network, repository, selection, sqlgen, validation
+from rag.connector import network, repository, selection, sqlcheck, sqlgen, validation
 from rag.connector import snapshots as snap
+from rag.connector.drivers import RunLimits as DriverLimits
 from rag.connector.drivers import Target as DriverTarget
 from rag.connector.drivers import driver as load_driver
 from rag.connector.errors import DRIVER_CODES, WARNING_CODES, ConnectorError, DriverError, ModelError
@@ -37,6 +39,17 @@ MODEL_FAILURES = {
     "llm_error": ("generation_failed", 502),
     "llm_cancelled": ("generation_cancelled", 499),
 }
+
+# How a failure of an execution is answered: driver code -> (code, HTTP status). Anything else: execution_failed (502).
+EXECUTION_FAILURES = {
+    "timeout": ("execution_timeout", 504),
+    "cancelled": ("execution_cancelled", 499),
+    "account_can_write": ("account_can_write", 409),
+    "permission_denied": ("permission_denied", 403),
+    "query_error": ("query_failed", 422),
+}
+# What the security event of an execution says (the event vocabulary is fixed, see rag/auth/events.py).
+EXECUTION_OUTCOMES = frozenset(EXECUTION_FAILURES)
 
 # What a person may change about WHERE the credential goes. Changing any of it, or the password, needs a fresh step-up
 # confirmation: otherwise a stolen session could point the stored credential at a server of its own.
@@ -73,6 +86,7 @@ class Service:
         self._sql_completer = sql_completer
         self._today = clock or (lambda: datetime.datetime.now(datetime.timezone.utc).date())
         self._sql_slots = threading.BoundedSemaphore(max(1, config.SQL_MAX_CONCURRENT))
+        self._exec_slots = threading.BoundedSemaphore(max(1, config.SQL_EXEC_MAX_CONCURRENT))
         self._network = {key: value for key, value in (("resolver", resolver), ("internal", internal)) if value}
         self._driver = driver_lookup
         self._slots = threading.BoundedSemaphore(max(1, config.CONNECTOR_MAX_CONCURRENT))
@@ -639,6 +653,178 @@ class Service:
         if "\x00" in text:
             raise ConnectorError("invalid_question", 400, reason="bad_characters")
         return text
+
+    # ----- validating and running SQL (M4.4) -----
+
+    def _target_token(self, row):
+        """A short digest of WHERE queries would go (not a secret: nothing of it can be read back from it). The page
+        hands it back with `expected`, and a changed target is refused."""
+        parts = [str(row[key]) for key in ("provider", "host", "port", "database_name", "username")]
+        return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
+
+    def _sql_limits(self, max_rows=None):
+        cap = config.SQL_EXEC_MAX_ROWS_HARD
+        rows = min(max_rows or config.SQL_EXEC_MAX_ROWS, config.SQL_EXEC_MAX_ROWS, cap)
+        return {
+            "max_rows": rows,
+            "timeout_s": config.SQL_EXEC_TIMEOUT_S,
+            "max_result_bytes": config.SQL_EXEC_MAX_BYTES,
+            "max_cell_chars": config.SQL_EXEC_MAX_CELL_CHARS,
+        }
+
+    def _analyse(self, owner, connection_id, row, sql, max_rows=None):
+        """The one place SQL is analysed, for validation and for execution alike: the owner's connection, its CURRENT
+        snapshot (stale, empty, never discovered and 'pointed elsewhere' are refused) and its selection."""
+        if not row["is_enabled"]:
+            raise ConnectorError("connection_disabled", 409)
+        revision, items, chosen = self._stored_selection(owner, connection_id)
+        fresh = self._freshness(owner, connection_id, row, chosen, items)
+        if fresh["state"] != freshness_model.CURRENT:
+            raise ConnectorError("context_stale", 409, reason=fresh["state"])
+        if not chosen.items:
+            raise ConnectorError("context_empty", 409)
+        catalog = snap.SelectedCatalog(snap.SnapshotSource(owner, connection_id, row, None, {}), chosen)
+        limits = self._sql_limits(max_rows)
+        found = sqlcheck.analyze(
+            sql,
+            row["provider"],
+            catalog,
+            sqlcheck.Limits(
+                config.SQL_INPUT_MAX_CHARS,
+                config.SQL_VALIDATION_MAX_NODES,
+                config.SQL_VALIDATION_MAX_DEPTH,
+                limits["max_rows"],
+            ),
+        )
+        context = {
+            "state": fresh["state"],
+            "snapshot_version": fresh["snapshot"]["version"],
+            "snapshot_fingerprint": fresh["snapshot"]["fingerprint"],
+            "selection_revision": revision,
+            "target": self._target_token(row),
+            "scope": "the tables and columns of the current snapshot that are selected",
+            "selected_objects": sum(1 for _kind, picked in catalog.objects().values() if picked),
+        }
+        return found, context, limits
+
+    def validate_sql(self, owner, connection_id, sql):
+        """Is this text ONE read-only query over objects this connection's owner has made available, and what is the
+        exact text that would be run? Nothing is run and the external database is not contacted."""
+        row = self._row(owner, connection_id)
+        found, context, limits = self._analyse(owner, connection_id, row, sql)
+        self._events.emit(
+            "sql_validated", "ok" if found.ok else "rejected", principal_id=owner, event_ref=connection_id
+        )
+        return {
+            "status": "valid" if found.ok else "invalid",
+            "execution_allowed": found.ok,
+            "provider": row["provider"],
+            "dialect": sqlgen.dialect_of(row["provider"]),
+            "connection_id": str(connection_id),
+            "errors": found.errors,
+            "warnings": found.warnings,
+            "normalized_sql": found.sql,
+            "referenced": {"tables": found.tables, "functions": found.functions},
+            "context": context,
+            "limits": limits,
+            "validation": "passed" if found.ok else "failed",
+            "executed": False,
+        }
+
+    def execute_sql(self, owner, connection_id, sql, expected=None, max_rows=None, cancel=None):
+        """Run a query read-only against the external database and return a bounded result. Nothing about an earlier
+        validation is trusted: the owner, the connection, the target, the schema and the SQL are all checked again,
+        here, and what runs is the canonical text of THIS analysis. A security event is written BEFORE the query is
+        sent (no record, no execution); the SQL is not in it."""
+        self._row(owner, connection_id)
+        with self._external(owner, connection_id) as (row, target, password):
+            found, context, limits = self._analyse(owner, connection_id, row, sql, max_rows)
+            wanted = {
+                "snapshot_fingerprint": context["snapshot_fingerprint"],
+                "selection_revision": context["selection_revision"],
+                "target": context["target"],
+            }
+            if any(value is not None and value != wanted[key] for key, value in (expected or {}).items()):
+                raise ConnectorError("context_changed", 409)
+            if not found.ok:
+                self._events.emit("sql_validated", "rejected", principal_id=owner, event_ref=connection_id)
+                raise ConnectorError("sql_rejected", 422, reason=found.errors[0]["code"], details=found.errors)
+            if not self._exec_slots.acquire(blocking=False):
+                raise ConnectorError("busy", 429)
+            request_id = str(uuid.uuid4())
+            try:
+                # The row was read before this operation claimed the connection (resolving the name takes time in
+                # between): a change that was answered "done" in that time must hold for this run too.
+                latest = self._row(owner, connection_id)
+                if not latest["is_enabled"]:
+                    raise ConnectorError("connection_disabled", 409)
+                if latest["updated_at"] != row["updated_at"]:
+                    raise ConnectorError("context_changed", 409)
+                self._log_must_work()
+                self._record("sql_execution_started", "ok", owner, connection_id)
+                bounds = DriverLimits(
+                    limits["timeout_s"],
+                    config.SQL_EXEC_CONNECT_TIMEOUT_S,
+                    limits["max_rows"],
+                    limits["max_result_bytes"],
+                    limits["max_cell_chars"],
+                )
+                try:
+                    result = self._driver(row["provider"]).run(target, password, found.sql, bounds, cancel)
+                except Exception as failure:  # noqa: BLE001 - a DriverError, or anything else: only a fixed code goes on
+                    failed = failure.code if isinstance(failure, DriverError) else "failed"
+                    reason = failed if failed in EXECUTION_OUTCOMES else "failed"
+                    self._events.emit("sql_executed", reason, principal_id=owner, event_ref=connection_id)
+                    log.warning(
+                        "sql execution failed: request=%s connection=%s code=%s", request_id, connection_id, failed
+                    )
+                    failure = DriverError(failed)
+                    code, status = EXECUTION_FAILURES.get(failure.code, ("execution_failed", 502))
+                    raise ConnectorError(
+                        code, status, reason=failure.code if code == "execution_failed" else None
+                    ) from None
+            finally:
+                self._exec_slots.release()
+        self._events.emit(
+            "sql_executed", "truncated" if result.truncated else "ok", principal_id=owner, event_ref=connection_id
+        )
+        digest = hashlib.sha256(found.sql.encode("utf-8")).hexdigest()[:12]
+        log.info(
+            "sql executed: request=%s connection=%s rows=%d truncated=%s ms=%d sql_sha=%s",
+            request_id,
+            connection_id,
+            len(result.rows),
+            result.truncated or "no",
+            int(result.seconds * 1000),
+            digest,
+        )
+        warnings = list(found.warnings)
+        if result.truncated:
+            warnings.append(
+                {
+                    "code": "result_truncated",
+                    "message": f"the result was cut at the {result.truncated} limit: there is more",
+                }
+            )
+        return {
+            "status": "executed",
+            "request_id": request_id,
+            "connection_id": str(connection_id),
+            "provider": row["provider"],
+            "dialect": sqlgen.dialect_of(row["provider"]),
+            "executed_sql": found.sql,
+            "columns": result.columns,
+            "rows": result.rows,
+            "row_count": len(result.rows),
+            "truncated": bool(result.truncated),
+            "truncated_by": result.truncated,
+            "warnings": warnings,
+            "referenced": {"tables": found.tables, "functions": found.functions},
+            "context": context,
+            "limits": limits,
+            "validation": "passed",
+            "duration_ms": int(result.seconds * 1000),
+        }
 
     # ----- helpers -----
 

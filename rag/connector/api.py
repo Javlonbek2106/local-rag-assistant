@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from rag import config
 from rag.connector import service as service_module
 from rag.connector.bodylimit import BodyTooLarge, ConnectorBodyLimit
+from rag.connector.drivers import CancelToken
 from rag.connector.errors import ConnectorError
 
 NO_STORE = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
@@ -74,6 +75,26 @@ class GenerateBody(_Body):
     question: str = Field(min_length=1, max_length=2000)
 
 
+class Expected(_Body):
+    """What the page saw when it validated: execution is refused if any of it has changed since."""
+
+    snapshot_fingerprint: str | None = Field(default=None, max_length=128)
+    selection_revision: int | None = Field(default=None, ge=0, le=INT_MAX)
+    target: str | None = Field(default=None, max_length=64)
+
+
+class ValidateBody(_Body):
+    sql: str = Field(
+        min_length=1, max_length=100000
+    )  # (the real limit is RAG_SQL_INPUT_MAX_CHARS, checked by the service)
+
+
+class ExecuteBody(_Body):
+    sql: str = Field(min_length=1, max_length=100000)
+    max_rows: int | None = Field(default=None, ge=1, le=INT_MAX)
+    expected: Expected | None = None
+
+
 class DescriptionBody(_Body):
     target_kind: str = Field(max_length=20)
     schema_name: str = Field(default="", max_length=300)
@@ -86,6 +107,8 @@ def connector_error_response(_request, error):
     body = {"code": error.code}
     if error.reason:
         body["reason"] = error.reason
+    if error.details:
+        body["details"] = error.details
     return JSONResponse({"error": body}, status_code=error.status, headers=NO_STORE)
 
 
@@ -98,9 +121,9 @@ async def validation_error_response(request, error):
     return JSONResponse({"error": {"code": "invalid_request", "fields": fields}}, status_code=422, headers=NO_STORE)
 
 
-async def run_in_thread(_request, work):
-    """The default way to run the generation: in a worker thread, without a way to stop it when the client goes away.
-    rag/connector_wiring.py hands in a cancellable runner instead."""
+async def run_in_thread(_request, work, cancel=None):
+    """The default way to run blocking work (the generation, an execution): in a worker thread, without a way to stop it
+    when the client goes away. rag/connector_wiring.py hands in a cancellable runner instead."""
     return await asyncio.to_thread(work)
 
 
@@ -251,6 +274,28 @@ def build_router(service, principal, step_up, runner=run_in_thread):
         checked and not run (`validation: "not_performed"`, `executed: false`); that is M4.4."""
         outcome = await runner(request, lambda: service.generate_sql(who.id, connection_id, body.question))
         if outcome is None:  # the client hung up: nobody is waiting for an answer
+            return Response(status_code=499)
+        return outcome
+
+    @router.post("/{connection_id}/sql/validate")
+    def validate_sql(connection_id: str, body: ValidateBody, who: Owner):
+        """Parse and check a SQL text against this connection's selected, current schema (M4.4). Runs nothing and
+        does not contact the external database. `execution_allowed` is a fact about this moment, not a permission."""
+        return service.validate_sql(who.id, connection_id, body.sql)
+
+    @router.post("/{connection_id}/sql/execute")
+    async def execute_sql(connection_id: str, body: ExecuteBody, request: Request, who: Owner):
+        """Validate again, from scratch, and run the canonical text read-only with bounded results (M4.4). Nothing the
+        page says about an earlier validation is trusted; `expected` only lets the page ask to be refused if what it saw
+        has changed."""
+        cancel = CancelToken()
+        expected = body.expected.model_dump(exclude_none=True) if body.expected else {}
+        outcome = await runner(
+            request,
+            lambda: service.execute_sql(who.id, connection_id, body.sql, expected, body.max_rows, cancel),
+            cancel,
+        )
+        if outcome is None:
             return Response(status_code=499)
         return outcome
 

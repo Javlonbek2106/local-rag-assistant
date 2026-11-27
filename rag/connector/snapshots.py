@@ -612,3 +612,44 @@ class SnapshotSource:
                 (r["column_name"], r["data_type"], r["is_nullable"])
             )
         return out
+
+
+class SelectedCatalog:
+    """What a query may refer to, for the validator (sqlcheck.py): the objects of the CURRENT snapshot of this
+    connection and which of them the owner has selected; for the selected ones only, the columns the selection shows
+    (an excluded column does not exist for a query) and the foreign keys. Read through SnapshotSource, so it is scoped
+    to the owner and to the connection in the same way as the schema context."""
+
+    def __init__(self, source, chosen):
+        self._source, self._chosen = source, chosen
+        self._objects = {(schema, name): kind for schema, name, kind in source.objects()}
+        self._columns, self._foreign_keys = {}, {}
+
+    def objects(self):
+        return {key: (kind, self._chosen.selected(*key)) for key, kind in self._objects.items()}
+
+    def load(self, keys):
+        keys = [key for key in keys if key not in self._columns and self._chosen.selected(*key)]
+        if not keys:
+            return
+        columns = self._source.columns(keys)
+        constraints = self._source.constraints(set(keys))
+        for key in keys:
+            key_columns, foreign_keys = set(), []
+            for c in constraints.get(key, []):
+                if c["kind"] in ("primary_key", "foreign_key"):
+                    key_columns.update(c["columns"])
+                if c["kind"] == "foreign_key":
+                    foreign_keys.append((list(c["columns"]), c["ref_schema"], c["ref_object"], list(c["ref_columns"])))
+            self._columns[key] = [
+                (name, kind)
+                for name, kind, _nullable in columns.get(key, [])
+                if self._chosen.column_selected(key[0], key[1], name, frozenset(key_columns))
+            ]
+            self._foreign_keys[key] = foreign_keys
+
+    def columns(self, key):
+        return self._columns[key]
+
+    def foreign_keys(self, key):
+        return self._foreign_keys.get(key, [])

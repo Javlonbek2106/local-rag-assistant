@@ -107,6 +107,8 @@ class ConnectionsApi(ConnectorApi):
         self.fresh_extra = {}  # fields that replace those of the freshness answer (state, reasons, last_error ...)
         self.next_discover = None  # a list of changes the next discovery finds (then it makes a new version)
         self.sql_answer, self.sql_failure = None, None  # M4.3: what POST .../sql/generate answers with
+        self.sql_validation, self.sql_execution = None, None  # M4.4: what .../sql/validate and /sql/execute answer with
+        self.sx_failure = None  # (status, code, reason) for the next validate or execute
         self.context_extra = {}
 
     def freshness(self):
@@ -220,6 +222,12 @@ class ConnectionsApi(ConnectorApi):
                 200,
                 {"objects": 4, "columns": 8, "schema_discovered_at": "2026-11-19T05:20:00Z", "snapshot": snapshot},
             )
+        if tail in ("sql/validate", "sql/execute") and method == "POST":
+            if self.sx_failure:
+                status, code, reason = self.sx_failure
+                self.sx_failure = None
+                return self.reply(route, status, {"error": {"code": code, **({"reason": reason} if reason else {})}})
+            return self.reply(route, 200, self.sql_validation if tail == "sql/validate" else self.sql_execution)
         if tail == "sql/generate" and method == "POST":
             if self.sql_failure:
                 status, code, reason = self.sql_failure
@@ -1002,7 +1010,7 @@ def test_a_question_gets_a_proposed_query_shown_as_text_with_the_warning_and_the
     assert page.locator("#sg-sql").inner_text() == SQL_ANSWER["sql"]
     text = page.locator("#sg-result").inner_text()
     assert "SQL taklif qilindi" in text and "PostgreSQL" in text and "qwen-test" in text
-    assert "tekshirilmagan va hech qachon bajarilmaydi" in text
+    assert "tekshirilmagan va o'zi bajarilmaydi" in text
     assert "The ten first customers." in text and "customer.id is the key" in text
     assert "versiya 3" in text and "2/2 obyekt" in text and "sig'madi" not in text
     sent = [b for m, p, b in api.body_seen if p.endswith("/sql/generate")]
@@ -1144,4 +1152,194 @@ def test_the_proposal_flow_keeps_the_console_quiet(make):
     page.locator("#cn-sql").wait_for(state="visible")
     generate_in_page(page)
     page.locator("#sg-sql").wait_for()
+    assert not [c for c in make.consoles[quiet_from:] if c[0] == "error"]
+
+
+# ---------- M4.4: validating and running the proposal ----------
+
+VALID = {
+    "status": "valid",
+    "execution_allowed": True,
+    "errors": [],
+    "warnings": [{"code": "join_not_on_known_relationship", "message": "this join is not on a known relationship"}],
+    "normalized_sql": 'SELECT "c"."id" AS "id" FROM "sales"."customer" AS "c" LIMIT 1001',
+    "referenced": {"tables": [{"schema": "sales", "name": "customer", "columns": ["id", "name"]}], "functions": []},
+    "context": {
+        "state": "current",
+        "snapshot_version": 3,
+        "snapshot_fingerprint": "f" * 64,
+        "selection_revision": 4,
+        "target": "t" * 16,
+        "selected_objects": 2,
+    },
+    "limits": {"max_rows": 1000, "timeout_s": 30.0, "max_result_bytes": 1048576, "max_cell_chars": 2000},
+    "executed": False,
+}
+RESULT = {
+    "status": "executed",
+    "columns": [{"name": "id", "type": "int"}, {"name": "name", "type": "text"}],
+    "rows": [[1, "Anvar"], [2, None], [3, HOSTILE]],
+    "row_count": 3,
+    "truncated": False,
+    "truncated_by": None,
+    "warnings": [],
+    "duration_ms": 12,
+}
+
+
+def with_proposal(make, validation=VALID, execution=RESULT):
+    page, api, context = make(listed())
+    api.sql_answer = SQL_ANSWER
+    api.sql_validation, api.sql_execution = validation, execution
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sg-sql").wait_for()
+    return page, api, context
+
+
+def calls_to(api, suffix):
+    return [b for m, p, b in api.body_seen if m == "POST" and p.endswith(suffix)]
+
+
+def test_a_new_proposal_is_not_validated_and_cannot_be_executed_and_nothing_is_run(make):
+    page, api, _ = with_proposal(make)
+    assert page.locator("#sx-validate").is_visible() and page.locator("#sx-execute").is_hidden()
+    assert "taklif (tekshirilmagan, hali bajarilmagan)" in page.locator("#sx-state").inner_text()
+    assert calls_to(api, "/sql/validate") == [] and calls_to(api, "/sql/execute") == []  # generating runs nothing
+
+
+def test_validate_shows_the_verdict_the_text_that_will_run_and_the_limits_and_only_then_execute_appears(make):
+    page, api, _ = with_proposal(make)
+    page.locator("#sx-validate").click()
+    page.locator("#sx-normalized").wait_for()
+    assert calls_to(api, "/sql/validate") == [{"sql": SQL_ANSWER["sql"]}]  # exactly the proposal on the page
+    text = page.locator("#sx-validation").inner_text()
+    assert "Tekshiruvdan o'tdi" in text and "Aynan shu matn bajariladi" in text and "sales.customer (id, name)" in text
+    assert "1000 qator, 30 soniya, 1024 KB" in text and "sxemadagi ma'lum bog'lanishga asoslanmagan" in text
+    assert page.locator("#sx-normalized").inner_text() == VALID["normalized_sql"]
+    assert page.locator("#sx-execute").is_visible() and calls_to(api, "/sql/execute") == []  # visible, still not run
+    assert "tekshirildi, bajarishga ruxsat bor (hali bajarilmagan)" in page.locator("#sx-state").inner_text()
+
+
+def test_a_rejected_validation_lists_the_errors_in_words_and_offers_no_execute(make):
+    rejected = {
+        **VALID,
+        "status": "invalid",
+        "execution_allowed": False,
+        "normalized_sql": None,
+        "warnings": [],
+        "errors": [{"code": "dml_not_allowed", "message": "x"}, {"code": "unknown_table", "message": "y"}],
+    }
+    page, api, _ = with_proposal(make, rejected)
+    page.locator("#sx-validate").click()
+    page.locator("#sx-validation").wait_for(state="visible")
+    text = page.locator("#sx-validation").inner_text()
+    assert "Rad etildi" in text and "INSERT, UPDATE, DELETE, MERGE" in text
+    assert "Bunday jadval yoki ko'rinish yo'q" in text
+    assert page.locator("#sx-execute").is_hidden() and "Holat: rad etildi" in page.locator("#sx-state").inner_text()
+
+
+def test_execute_sends_the_text_and_what_the_page_saw_shows_a_bounded_table_as_text_and_the_state(make):
+    page, api, _ = with_proposal(make)
+    page.locator("#sx-validate").click()
+    page.locator("#sx-execute").wait_for(state="visible")
+    page.locator("#sx-execute").click()
+    page.locator("#sx-execution table").wait_for()
+    (sent,) = calls_to(api, "/sql/execute")
+    assert sent == {
+        "sql": SQL_ANSWER["sql"],
+        "expected": {"snapshot_fingerprint": "f" * 64, "selection_revision": 4, "target": "t" * 16},
+    }
+    rows = page.locator("#sx-execution tr")
+    assert rows.count() == 4 and "Bajarildi: 3 qator, 12 ms" in page.locator("#sx-execution").inner_text()
+    assert page.locator("#sx-execution td.muted").first.inner_text() == "NULL"
+    assert page.locator("#sx-execution img").count() == 0 and page.evaluate("window.pwned") is None  # values are text
+    assert HOSTILE in page.locator("#sx-execution").inner_text()
+    assert "Holat: bajarildi (3 qator)" in page.locator("#sx-state").inner_text()
+
+
+def test_a_cut_result_is_flagged_loudly(make):
+    note = [{"code": "result_truncated", "message": "m"}]
+    cut = {**RESULT, "truncated": True, "truncated_by": "rows", "warnings": note}
+    page, api, _ = with_proposal(make, execution=cut)
+    page.locator("#sx-validate").click()
+    page.locator("#sx-execute").wait_for(state="visible")
+    page.locator("#sx-execute").click()
+    page.locator("#sx-execution table").wait_for()
+    assert "KESILDI" in page.locator("#sx-execution").inner_text()
+    assert page.locator("#sx-execution .update.warn").count() == 1
+    assert "kesilgan" in page.locator("#sx-state").inner_text()
+
+
+@pytest.mark.parametrize(
+    "status,code,reason,expected",
+    [
+        (409, "context_stale", "stale", "Sxema konteksti hozir yangi emas"),
+        (409, "context_changed", None, "qayta tekshiring"),
+        (409, "account_can_write", None, "Faqat o'qish huquqli hisob"),
+        (504, "execution_timeout", None, "vaqt chegarasida tugamadi"),
+        (499, "execution_cancelled", None, "bekor qilindi"),
+        (422, "query_failed", None, "Baza so'rovni qabul qilmadi"),
+        (422, "sql_rejected", "dml_not_allowed", "SQL rad etildi"),
+        (429, "busy", None, "Band"),
+    ],
+)
+def test_a_failed_run_is_explained_and_the_earlier_validation_no_longer_counts(make, status, code, reason, expected):
+    page, api, _ = with_proposal(make)
+    page.locator("#sx-validate").click()
+    page.locator("#sx-execute").wait_for(state="visible")
+    api.sx_failure = (status, code, reason)
+    page.locator("#sx-execute").click()
+    page.locator("#sg-error").wait_for(state="visible")
+    assert expected in page.locator("#sg-error").inner_text()
+    assert page.locator("#sx-execute").is_hidden()
+    assert "bajarilmadi — qayta tekshiring" in page.locator("#sx-state").inner_text()
+    assert page.locator("#sx-execution").is_hidden()
+
+
+def test_a_failed_validation_is_shown_and_does_not_leave_a_stale_verdict(make):
+    page, api, _ = with_proposal(make)
+    api.sx_failure = (409, "context_stale", "stale")
+    page.locator("#sx-validate").click()
+    page.locator("#sg-error").wait_for(state="visible")
+    assert "Sxema konteksti hozir yangi emas" in page.locator("#sg-error").inner_text()
+    assert page.locator("#sx-execute").is_hidden()
+
+
+def test_choosing_another_connection_or_generating_again_removes_the_validation_and_the_result(make):
+    other = connection(id="33333333-3333-3333-3333-333333333333", name="Second")
+    page, api, _ = make(ConnectionsApi([connection(), other]))
+    api.sql_answer, api.sql_validation, api.sql_execution = SQL_ANSWER, VALID, RESULT
+    page.locator("#cn-sql").wait_for(state="visible")
+    generate_in_page(page)
+    page.locator("#sx-validate").click()
+    page.locator("#sx-execute").wait_for(state="visible")
+    page.locator("#sx-execute").click()
+    page.locator("#sx-execution table").wait_for()
+    generate_in_page(page)  # a new proposal: nothing of the old verdict stays
+    page.locator("#sx-state").wait_for()
+    for hidden in ("#sx-execute", "#sx-validation", "#sx-execution"):
+        assert page.locator(hidden).is_hidden()
+    page.locator("#sx-validate").click()
+    page.locator("#sx-execute").wait_for(state="visible")
+    page.locator("#sg-connection").select_option(label="Second (PostgreSQL)")
+    page.wait_for_function("document.getElementById('sg-result').hidden")
+    assert page.locator("#sx-execute").count() == 0
+
+
+def test_the_page_has_no_way_to_run_sql_that_was_not_validated(make):
+    page, api, _ = with_proposal(make)
+    assert page.locator("#sx-execute").is_hidden()
+    page.evaluate("document.getElementById('sx-execute').click()")  # even a scripted click on the hidden button
+    page.wait_for_timeout(300)
+    assert calls_to(api, "/sql/execute") == []
+
+
+def test_the_run_flow_keeps_the_console_quiet(make):
+    page, api, _ = with_proposal(make)
+    quiet_from = len(make.consoles)
+    page.locator("#sx-validate").click()
+    page.locator("#sx-execute").wait_for(state="visible")
+    page.locator("#sx-execute").click()
+    page.locator("#sx-execution table").wait_for()
     assert not [c for c in make.consoles[quiet_from:] if c[0] == "error"]

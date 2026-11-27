@@ -2,7 +2,7 @@
 
 import socket
 
-from rag.connector.drivers import Introspection, TestResult
+from rag.connector.drivers import Introspection, QueryResult, TestResult
 from rag.connector.errors import DriverError
 from rag.connector.vault import Vault, new_key_line
 
@@ -111,6 +111,11 @@ class FakeDriver:
     def __init__(self):
         self.calls, self.test_error, self.discover_error, self.version = [], None, None, "17.2"
         self.can_write, self.sample, self.fail_after = False, SAMPLE, None
+        self.run_result, self.run_error, self.run_gate = (
+            None,
+            None,
+            None,
+        )  # M4.4: what run() answers, fails with, waits for
 
     def test(self, target, password, timeout):
         self.calls.append(("test", target, password, timeout))
@@ -133,6 +138,20 @@ class FakeDriver:
         if self.discover_error:
             raise DriverError(self.discover_error)
         return Introspection()
+
+    def run(self, target, password, sql, limits, cancel=None):
+        self.calls.append(("run", target, password, sql, limits))
+        if cancel is not None:
+            cancel.attach(lambda: None)
+        try:
+            if self.run_gate is not None:
+                self.run_gate.wait(10)
+            if self.run_error:
+                raise self.run_error
+            return self.run_result or QueryResult([{"name": "id", "type": "int"}], [[1], [2]], None, 0.01)
+        finally:
+            if cancel is not None:
+                cancel.detach()
 
     def __call__(self, provider):
         self.calls.append(("lookup", provider))

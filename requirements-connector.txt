@@ -3,3 +3,4 @@
 cryptography==50.0.2   # AES-256-GCM for the credential vault, parsing of CA certificates
 python-tds==1.17.1     # SQL Server (pure Python, no system ODBC driver)
 pyOpenSSL==26.4.0      # TLS for python-tds (certificate-checked connections to SQL Server)
+sqlglot==30.33.0     # SQL validation (M4.4): an AST parser for PostgreSQL and T-SQL; pure Python, no dependencies

@@ -28,11 +28,13 @@ def build_service(events):
     return Service(Vault(read_key_ring), events, sql_completer=sqlmodel.complete)
 
 
-async def run_cancellable(request, work):
+async def run_cancellable(request, work, cancel=None):
     """Run `work()` (the SQL generation: some database reads and one call to the model) in a thread that has an Ollama
     cancellation scope, and wait for it while watching the client. Returns what `work` returns, raises what it raises,
     and returns None when the client went away first: the scope is then cancelled, which closes the connection to
-    Ollama and frees the model within moments (the same relay the question answerer uses)."""
+    Ollama and frees the model within moments (the same relay the question answerer uses). `cancel` (a
+    drivers.CancelToken)
+    is also cancelled then: a query that is running on the external database is stopped as well."""
     relay = Relay(lambda: iter([work()])).start()
     gone = asyncio.Event()
 
@@ -49,6 +51,8 @@ async def run_cancellable(request, work):
             if event is None:
                 if gone.is_set():
                     relay.cancel()
+                    if cancel:
+                        cancel.cancel()
                     log.info("sql generation: the client went away; stopped")
                     return None
                 continue
@@ -61,6 +65,8 @@ async def run_cancellable(request, work):
                 return outcome
     except BaseException:
         relay.cancel()
+        if cancel:
+            cancel.cancel()
         raise
     finally:
         watcher.cancel()

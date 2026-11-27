@@ -170,7 +170,10 @@ def test_the_proposal_is_returned_even_when_it_is_not_valid_sql_because_nothing_
     assert body["sql"].startswith("DROP TABLE") and body["validation"] == "not_performed" and body["executed"] is False
 
 
-def test_there_is_no_route_that_runs_a_query(env):
+def test_generation_runs_nothing_and_the_only_route_that_runs_a_query_is_the_validating_one_of_m44(env):
+    """M4.3 generates; M4.4 added `/sql/execute`, which validates again and runs. No other route takes a query."""
     paths = [p for p in env.app.openapi()["paths"] if p.startswith(BASE)]
-    assert not [p for p in paths if any(word in p for word in ("execute", "run", "query"))]
     assert [p for p in paths if p.endswith("/sql/generate")]
+    assert [p for p in paths if any(word in p for word in ("execute", "run", "query"))] == [
+        "/api/v1/connections/{connection_id}/sql/execute"
+    ]

@@ -170,3 +170,15 @@ SQL_PROMPT_MAX_CHARS = int(os.getenv("RAG_SQL_PROMPT_MAX_CHARS", "16000"))  # th
 SQL_MAX_OUTPUT_CHARS = int(os.getenv("RAG_SQL_MAX_OUTPUT_CHARS", "8000"))  # a longer generated query is refused
 SQL_MAX_CONCURRENT = int(os.getenv("RAG_SQL_MAX_CONCURRENT", "2"))  # generations at once (the model does one at a time)
 SQL_CHARS_PER_TOKEN = float(os.getenv("RAG_SQL_CHARS_PER_TOKEN", "2.5"))  # cautious: prompt + answer must fit
+
+# SQL validation and execution (roadmap M4.4, docs/sql-validation.md). Every limit is enforced on the server.
+SQL_INPUT_MAX_CHARS = int(os.getenv("RAG_SQL_INPUT_MAX_CHARS", "20000"))  # the longest SQL text that is analysed
+SQL_VALIDATION_MAX_NODES = int(os.getenv("RAG_SQL_VALIDATION_MAX_NODES", "3000"))  # parts of the syntax tree
+SQL_VALIDATION_MAX_DEPTH = int(os.getenv("RAG_SQL_VALIDATION_MAX_DEPTH", "150"))  # how deep the tree may be
+SQL_EXEC_TIMEOUT_S = float(os.getenv("RAG_SQL_EXEC_TIMEOUT_S", "30"))  # one query, first statement to last row
+SQL_EXEC_CONNECT_TIMEOUT_S = float(os.getenv("RAG_SQL_EXEC_CONNECT_TIMEOUT_S", "10"))  # getting a connection
+SQL_EXEC_MAX_ROWS = int(os.getenv("RAG_SQL_EXEC_MAX_ROWS", "1000"))  # rows returned; a request may ask for fewer
+SQL_EXEC_MAX_ROWS_HARD = int(os.getenv("RAG_SQL_EXEC_MAX_ROWS_HARD", "10000"))  # the largest value that can be set
+SQL_EXEC_MAX_BYTES = int(os.getenv("RAG_SQL_EXEC_MAX_BYTES", "1048576"))  # size of the returned values (JSON text)
+SQL_EXEC_MAX_CELL_CHARS = int(os.getenv("RAG_SQL_EXEC_MAX_CELL_CHARS", "2000"))  # a longer value is cut
+SQL_EXEC_MAX_CONCURRENT = int(os.getenv("RAG_SQL_EXEC_MAX_CONCURRENT", "2"))  # executions at once (429 busy beyond it)
