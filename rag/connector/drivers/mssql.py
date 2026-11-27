@@ -19,10 +19,11 @@ import contextlib
 import logging
 import socket
 import tempfile
+import threading
 import time
 from pathlib import Path
 
-from rag.connector.drivers import Introspection, TestResult
+from rag.connector.drivers import Introspection, QueryResult, TestResult, cell, row_size
 from rag.connector.errors import DriverError
 
 FETCH = 1000
@@ -71,15 +72,61 @@ INDEXES = (
     "AND col.column_id = ic.column_id WHERE o.type IN ('U', 'V') AND i.type > 0 AND i.name IS NOT NULL "
     f"AND {USER_OBJECTS} ORDER BY s.name, o.name, i.name, ic.key_ordinal"
 )
-CAN_WRITE = (
-    "SELECT CASE WHEN IS_SRVROLEMEMBER('sysadmin') = 1 OR IS_MEMBER('db_owner') = 1 OR IS_MEMBER('db_datawriter') = 1 "
-    "OR IS_MEMBER('db_ddladmin') = 1 OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT') = 1 "
-    "OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UPDATE') = 1 "
-    "OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'DELETE') = 1 "
-    "OR HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') = 1 THEN 1 ELSE 0 END"
+# Can the account change anything? Written the other way round: the answer is 0 ("it cannot") only when every part
+# proves it, and 1 otherwise, also when a part answers NULL. Allowlists, not denylists: a permission that is not known
+# to be read-only counts as a write: at the server, at the database, on a schema, on an object (columns included) and
+# in any grant made to the account or to a role it is in (which also covers what the other parts do not list, such as
+# IMPERSONATE on a user or a login, types, triggers and synonyms).
+SERVER_READ = (
+    "'CONNECT SQL', 'CONNECT', 'VIEW ANY DATABASE', 'VIEW ANY DEFINITION', 'VIEW SERVER STATE', "
+    "'VIEW SERVER PERFORMANCE STATE', 'VIEW SERVER SECURITY STATE', 'VIEW ANY PERFORMANCE DEFINITION', "
+    "'VIEW ANY SECURITY DEFINITION'"
+)
+OBJECT_READ = "'SELECT', 'VIEW DEFINITION', 'VIEW CHANGE TRACKING'"
+DATABASE_READ = (
+    f"'CONNECT', {OBJECT_READ}, 'SHOWPLAN', 'VIEW DATABASE STATE', 'VIEW DATABASE PERFORMANCE STATE', "
+    "'VIEW DATABASE SECURITY STATE', 'VIEW PERFORMANCE DEFINITION', 'VIEW SECURITY DEFINITION', "
+    "'VIEW ANY COLUMN MASTER KEY DEFINITION', 'VIEW ANY COLUMN ENCRYPTION KEY DEFINITION'"
+)
+SERVER_ROLES = ("sysadmin", "securityadmin", "serveradmin", "setupadmin", "processadmin", "diskadmin", "dbcreator")
+DATABASE_ROLES = ("db_owner", "db_securityadmin", "db_accessadmin", "db_ddladmin", "db_datawriter", "db_backupoperator")
+NOT_IN_A_ROLE = " AND ".join(
+    [f"ISNULL(IS_SRVROLEMEMBER('{role}'), 1) = 0" for role in (*SERVER_ROLES, "bulkadmin")]
+    + [f"ISNULL(IS_MEMBER('{role}'), 1) = 0" for role in DATABASE_ROLES]
+)
+CAN_CHANGE_ANYTHING = (
+    f"SELECT CASE WHEN {NOT_IN_A_ROLE} "
+    "AND EXISTS (SELECT 1 FROM sys.fn_my_permissions(NULL, 'DATABASE') WHERE permission_name = 'CONNECT') "
+    "AND NOT EXISTS (SELECT 1 FROM sys.fn_my_permissions(NULL, 'SERVER') "
+    f"WHERE permission_name NOT IN ({SERVER_READ})) "
+    "AND NOT EXISTS (SELECT 1 FROM sys.fn_my_permissions(NULL, 'DATABASE') "
+    f"WHERE permission_name NOT IN ({DATABASE_READ})) "
+    # (schema ids from 16384 on belong to the fixed database roles: a member of db_datareader "controls" the empty
+    # schema of that name; an object put into one is still judged by the next part)
+    "AND NOT EXISTS (SELECT 1 FROM sys.schemas s "
+    "CROSS APPLY sys.fn_my_permissions(QUOTENAME(s.name), 'SCHEMA') p "
+    "WHERE s.schema_id < 16384 AND s.name NOT IN ('sys', 'INFORMATION_SCHEMA') "
+    f"AND p.permission_name NOT IN ({OBJECT_READ})) "
+    "AND NOT EXISTS (SELECT 1 FROM sys.objects o CROSS APPLY sys.fn_my_permissions("
+    "QUOTENAME(SCHEMA_NAME(o.schema_id)) + '.' + QUOTENAME(o.name), 'OBJECT') p WHERE o.is_ms_shipped = 0 "
+    "AND o.type IN ('U', 'V', 'P', 'PC', 'FN', 'FS', 'FT', 'IF', 'TF', 'AF', 'X', 'SN', 'SO', 'SQ') "
+    f"AND p.permission_name NOT IN ({OBJECT_READ})) "
+    "AND NOT EXISTS (SELECT 1 FROM sys.database_permissions g WHERE g.state IN ('G', 'W') "
+    "AND g.grantee_principal_id <> 0 AND (g.grantee_principal_id = DATABASE_PRINCIPAL_ID() "
+    "OR IS_MEMBER(USER_NAME(g.grantee_principal_id)) = 1) "
+    f"AND g.permission_name NOT IN ({DATABASE_READ})) "
+    "AND NOT EXISTS (SELECT 1 FROM sys.server_permissions g WHERE g.state IN ('G', 'W') "
+    "AND (g.grantee_principal_id = SUSER_ID() OR (SUSER_NAME(g.grantee_principal_id) <> 'public' "
+    "AND IS_SRVROLEMEMBER(SUSER_NAME(g.grantee_principal_id)) = 1)) "
+    f"AND g.permission_name NOT IN ({SERVER_READ})) "
+    "THEN 0 ELSE 1 END"
 )
 VERSION = "SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(32))"
 KINDS = {"U": "table", "V": "view"}
+
+
+# Errors of the query itself: syntax, a name, a conversion, an overflow, a division by zero, a function used wrongly.
+QUERY_ERRORS = frozenset({102, 137, 156, 174, 195, 207, 208, 241, 242, 245, 4104, 4121, 8114, 8115, 8120, 8134, 8152})
 
 
 def classify(error):
@@ -93,6 +140,13 @@ def classify(error):
         return "auth_failed"
     if number in (229, 230, 262, 297, 300, 916):
         return "permission_denied"
+    if number in QUERY_ERRORS or type(error).__name__ in (
+        "ProgrammingError",
+        "DataError",
+        "IntegrityError",
+        "NotSupportedError",
+    ):
+        return "query_error"  # the query itself: a name, a value, a type, a syntax the server does not take
     if isinstance(error, TimeoutError) or "timeout" in name or "timed out" in text:
         return "timeout"
     if "ssl" in name or "ssl" in text or "certificate" in text or "tls" in text or "openssl" in type(error).__module__:
@@ -117,7 +171,7 @@ def _driver():
 
 
 @contextlib.contextmanager
-def _connection(target, password, timeout):
+def _connection(target, password, timeout, query_timeout=None, autocommit=True):
     pytds = _driver()
     with contextlib.ExitStack() as stack:
         options = {}
@@ -149,9 +203,9 @@ def _connection(target, password, timeout):
                 user=target.user,
                 password=password,
                 login_timeout=timeout,
-                timeout=timeout,
+                timeout=query_timeout or timeout,
                 appname="rag-connector",
-                autocommit=True,
+                autocommit=autocommit,
                 readonly=True,
                 disable_connect_retry=True,
                 **options,
@@ -159,6 +213,7 @@ def _connection(target, password, timeout):
         except Exception as error:  # noqa: BLE001 - every driver failure becomes one fixed code
             raise DriverError(classify(error)) from None
         stack.callback(conn.close)
+        conn.rag_socket = sock  # (so that a run can be stopped by closing it)
         yield conn
 
 
@@ -169,17 +224,96 @@ def _scalar(conn, sql):
     return row[0] if row else None
 
 
+def _can_write(conn):
+    """Anything but a clear "no" counts as "yes"."""
+    return _scalar(conn, CAN_CHANGE_ANYTHING) != 0
+
+
 def test(target, password, timeout):
     try:
         with _connection(target, password, timeout) as conn:
             _scalar(conn, "SELECT 1")
             version = str(_scalar(conn, VERSION) or "")
-            writable = bool(_scalar(conn, CAN_WRITE))
+            writable = _can_write(conn)
     except DriverError:
         raise
     except Exception as error:  # noqa: BLE001
         raise DriverError(classify(error)) from None
     return TestResult(version=".".join(version.split(".")[:2]), can_write=writable)
+
+
+def run(target, password, sql, limits, cancel=None):
+    """Run ONE query that the validator (sqlcheck.py) wrote and return its bounded result. This module does not look at
+    the SQL: it is never called with a text that did not come from there.
+
+    SQL Server has no read-only session, so the protection is the account: it must hold NO permission that could change
+    anything (CAN_CHANGE_ANYTHING, checked on this very connection, every time; otherwise `account_can_write` and
+    nothing is run). The transaction that is always rolled back is only a second net: it does not undo everything (a
+    sequence value, something that leaves the server). Time: the socket timeout bounds every wait, a timer closes the
+    socket when the whole run has taken too long, and so does a client that goes away. Rows are read one at a time;
+    reading stops at the row or byte limit and the connection is dropped."""
+    started = time.monotonic()
+    shown = None
+    expired = threading.Event()
+    try:
+        with _connection(target, password, limits.connect_timeout_s, limits.timeout_s, autocommit=False) as conn:
+
+            def stop():
+                conn.rag_socket.shutdown(socket.SHUT_RDWR)
+
+            def expire():
+                expired.set()
+                with contextlib.suppress(OSError):
+                    stop()
+
+            timer = threading.Timer(limits.timeout_s, expire)
+            timer.daemon = True
+            if cancel:
+                cancel.attach(stop)
+            try:
+                if cancel and cancel.cancelled:
+                    raise DriverError("cancelled")
+                timer.start()
+                with conn.cursor() as cursor:
+                    cursor.execute("SET LOCK_TIMEOUT 5000")
+                if _can_write(conn):
+                    raise DriverError("account_can_write")
+                with conn.cursor() as cursor:
+                    cursor.execute(sql)
+                    shown = [{"name": str(c[0] or ""), "type": ""} for c in (cursor.description or [])]
+                    rows, truncated, size = [], None, 0
+                    while True:
+                        raw = cursor.fetchone()
+                        if expired.is_set() or time.monotonic() - started > limits.timeout_s:
+                            raise DriverError("timeout")
+                        if raw is None:
+                            break
+                        if len(rows) >= limits.max_rows:
+                            truncated = "rows"
+                            break
+                        row = [cell(v, limits.max_cell_chars) for v in raw]
+                        size += row_size(row)
+                        if size > limits.max_bytes:
+                            truncated = "bytes"
+                            break
+                        rows.append(row)
+                if truncated:  # unread rows are still on the wire: drop the connection instead of waiting for them
+                    conn.rag_socket.shutdown(socket.SHUT_RDWR)
+                else:
+                    conn.rollback()
+            finally:
+                timer.cancel()
+                if cancel:
+                    cancel.detach()
+    except Exception as error:  # noqa: BLE001
+        if cancel and cancel.cancelled:
+            raise DriverError("cancelled") from None
+        if expired.is_set():  # (the timer closed the socket: whatever the driver made of that, it was the time)
+            raise DriverError("timeout") from None
+        if isinstance(error, DriverError):
+            raise
+        raise DriverError(classify(error)) from None
+    return QueryResult(shown, rows, truncated, round(time.monotonic() - started, 3))
 
 
 def _rows(conn, sql, deadline):

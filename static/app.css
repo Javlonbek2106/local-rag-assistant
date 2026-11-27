@@ -92,6 +92,8 @@ textarea:focus-visible { outline: 2px solid var(--accent); border-color: transpa
 .cn-context pre { padding: 8px; border: 1px solid var(--line); border-radius: 8px; max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .cn-pick { display: inline-flex; gap: 4px; align-items: center; font-size: 13px; margin-right: 6px; }
 .sg-result { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.sx-box { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.sx-table { max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
 .sg-sql { margin: 4px 0; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; font-size: 13px; }
 #cn-sql textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); width: 100%; }
 #cn-sql select { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); max-width: 100%; }

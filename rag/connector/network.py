@@ -8,7 +8,9 @@ documents. The decision recorded in docs/connector.md:
   fe80::/10), multicast, reserved and broadcast. IPv4-mapped IPv6 is judged by the IPv4 address inside it. A name is
   resolved and EVERY address it resolves to is judged (a name with one blocked address is blocked).
 - BLOCKED always: this application's own database (same address, same port and the same database name, or one of its
-  own roles): the connector must never be pointed at the source of truth (SR-9).
+  own roles; any two addresses of this computer, loopback or its network interfaces, count as the same): the connector
+  must never be pointed at the source of truth (SR-9). Not seen through: another computer's forwarder or a published
+  port with another number.
 - ALLOWED by default: loopback and private ranges (10/8, 172.16/12, 192.168/16, fc00::/7). The people who use this
   application keep their other projects' databases on this computer or on the office network; a blanket "no private
   addresses" rule would make the connector useless for them. This is a deliberate, documented decision, not an
@@ -106,8 +108,21 @@ def internal_database():
     return parts.hostname or "", parts.port or 5432, parts.path.lstrip("/")
 
 
+def _on_this_machine(address):
+    """Is this an address of this computer (loopback or one of its network interfaces)? Only its own can be bound."""
+    if address.is_loopback:
+        return True
+    family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as probe:
+            probe.bind((str(address), 0))
+    except OSError:
+        return False
+    return True
+
+
 def _same_machine(a, b):
-    return a == b or (a.is_loopback and b.is_loopback)
+    return a == b or (_on_this_machine(a) and _on_this_machine(b))
 
 
 def check_target(host, port, database, username, *, resolver=socket.getaddrinfo, internal=internal_database):

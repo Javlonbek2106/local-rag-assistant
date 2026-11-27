@@ -9,6 +9,7 @@ select = ["E", "F", "I", "B"]
 "rag/api.py" = ["B008"]  # FastAPI's File(...) default is the documented idiom
 "rag/answer.py" = ["E501"]  # the prompt text is one long sentence per rule
 "rag/connector/sqlgen.py" = ["E501"]  # the same: the rules of the SQL prompt are one sentence per line
+"rag/connector/sqlcheck.py" = ["E501"]  # the allowlists are long words lists and the messages one sentence each
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

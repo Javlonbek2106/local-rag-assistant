@@ -1479,6 +1479,7 @@ function sgError(text) {
 }
 
 function sgReset() {
+  sxReset();
   $("sg-result").hidden = true;
   $("sg-result").replaceChildren();
   $("sg-copy").hidden = true;
@@ -1531,7 +1532,7 @@ function sgShow(d) {
   const proposed = d.status === "generated";
   parts.push(el("div", proposed ? "muted" : "update warn",
     `${proposed ? "SQL taklif qilindi" : "Model aniqlik so'radi"} · ${d.dialect} · model ${d.model} · ${d.duration_ms} ms`));
-  parts.push(el("div", "update warn", "Bu SQL tekshirilmagan va hech qachon bajarilmaydi: faqat taklif. Ishlatishdan oldin o'zingiz tekshiring."));
+  parts.push(el("div", "update warn", "Bu SQL tekshirilmagan va o'zi bajarilmaydi: faqat taklif. Avval «Tekshirish» ni bosing; bajarish faqat siz «Bajarish» ni bosganingizda."));
   if (d.sql) {
     const pre = el("pre", "sg-sql", d.sql);
     pre.id = "sg-sql";
@@ -1543,6 +1544,26 @@ function sgShow(d) {
   let note = `Sxema: versiya ${c.snapshot_version}, ${FRESH_TEXT[c.state] || c.state}, ${c.included_objects}/${c.selected_objects} obyekt modelga berildi`;
   if (!c.complete) note += `; ${c.omitted_objects} obyekt sig'madi, shuning uchun modelga ko'rinmadi`;
   parts.push(el("div", c.complete ? "muted" : "update warn", `${note}.`));
+  sxReset();
+  if (d.sql) {
+    sxCurrent = { sql: d.sql, validation: null };
+    const actions = el("div", "cn-actions");
+    const validate = cnButton("Tekshirish", sxValidate);
+    validate.id = "sx-validate";
+    const run = cnButton("Bajarish", sxExecute, "primary");
+    run.id = "sx-execute";
+    run.hidden = true; // only after a successful validation of exactly this text
+    actions.append(validate, run);
+    const state = el("div", "muted", "Holat: taklif (tekshirilmagan, hali bajarilmagan)");
+    state.id = "sx-state";
+    const validation = el("div", "sx-box");
+    validation.id = "sx-validation";
+    validation.hidden = true;
+    const execution = el("div", "sx-box");
+    execution.id = "sx-execution";
+    execution.hidden = true;
+    parts.push(state, actions, validation, execution);
+  }
   $("sg-result").replaceChildren(...parts);
   $("sg-result").hidden = false;
   $("sg-copy").hidden = !d.sql;
@@ -1597,6 +1618,161 @@ $("sg-connection").addEventListener("change", () => { sgReset(); sgFreshness(); 
 $("sg-question").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); sgGenerate(); }
 });
+
+// ----- validating and running the proposal (roadmap M4.4, docs/sql-validation.md) -----
+// The page never decides anything about the SQL: the server parses it, checks it against the selected current schema and
+// says whether it may be run. "Bajarish" appears only after a successful validation of exactly this text, runs only when the
+// person clicks it, and the server validates again before it runs anything. SQL and result values are shown as text.
+const SX_TEXT = {
+  sql_rejected: "SQL rad etildi.", context_changed: "Sxema, tanlov yoki ulanish o'zgargan: qayta tekshiring.",
+  account_can_write: "Ulanish hisobi ma'lumotni o'zgartira oladi: SQL bajarilmaydi. Faqat o'qish huquqli hisob kerak (docs/sql-validation.md).",
+  execution_timeout: "So'rov vaqt chegarasida tugamadi va to'xtatildi.", execution_cancelled: "Bajarish bekor qilindi.",
+  query_failed: "Baza so'rovni qabul qilmadi (nom, tur yoki qiymat xatosi).", execution_failed: "Bajarib bo'lmadi.",
+  sql_validator_unavailable: "SQL tekshiruvchisi o'rnatilmagan (requirements-connector.txt).",
+  dml_not_allowed: "Ma'lumotni o'zgartiruvchi ifoda (INSERT, UPDATE, DELETE, MERGE) mumkin emas.",
+  ddl_not_allowed: "Tuzilmani o'zgartiruvchi ifoda (CREATE, ALTER, DROP, TRUNCATE) mumkin emas.",
+  exec_not_allowed: "EXEC va protseduralar mumkin emas.", select_into_not_allowed: "SELECT ... INTO mumkin emas.",
+  locking_not_allowed: "Qulflash (FOR UPDATE) mumkin emas.", hints_not_allowed: "Hint va so'rov opsiyalari mumkin emas.",
+  multiple_statements: "Faqat bitta ifoda mumkin.", syntax_error: "SQL ni o'qib bo'lmadi (sintaksis xatosi).",
+  empty_sql: "SQL bo'sh.", unknown_table: "Bunday jadval yoki ko'rinish yo'q.", table_not_selected: "Bu jadval tanlanmagan (AI ochiq obyektlar ro'yxatida yo'q).",
+  unknown_column: "Bunday ustun yo'q yoki tanlanmagan.", ambiguous_column: "Ustun nomi bir nechta jadvalga mos: jadval nomini yozing.",
+  function_not_allowed: "Bu funksiya ruxsat etilmagan.", dangerous_function: "Xavfli funksiya mumkin emas.",
+  join_without_condition: "Har bir JOIN ga shart (ON) kerak.", natural_join_not_allowed: "NATURAL JOIN mumkin emas.",
+  cross_database_not_allowed: "Boshqa baza yoki server nomi mumkin emas.", recursive_cte_not_allowed: "Rekursiv CTE mumkin emas.",
+  too_complex: "SQL juda murakkab.", sql_too_large: "SQL juda uzun.", unsupported_construct: "Bu konstruksiya qo'llab-quvvatlanmaydi.",
+  table_function_not_allowed: "Jadval funksiyalari mumkin emas.", variables_not_allowed: "O'zgaruvchilar mumkin emas.",
+  session_statement_not_allowed: "Sessiya buyruqlari mumkin emas.", join_not_on_known_relationship: "Bu JOIN sxemadagi ma'lum bog'lanishga asoslanmagan.",
+  join_condition_not_a_key_equality: "JOIN sharti ikki ustunni solishtirmaydi.", result_truncated: "Natija chegarada kesildi: undan ko'p ma'lumot bor.",
+};
+Object.assign(CN_TEXT, SX_TEXT);
+let sxCurrent = null; // {sql, validation}: the proposal on the page and what the server said about exactly this text
+let sxBusy = false;
+
+function sxState(text, kind) {
+  const box = $("sx-state");
+  if (!box) return;
+  setText(box, text);
+  setClass(box, kind === "bad" ? "update warn" : "muted");
+}
+
+function sxReset() {
+  sxCurrent = null;
+}
+
+function sxProblems(title, items) {
+  if (!items || !items.length) return null;
+  const box = el("div", "");
+  box.append(el("strong", "", title));
+  const list = el("ul", "cn-keys");
+  for (const p of items) list.append(el("li", "", `${CN_TEXT[p.code] || p.code}${p.message && !CN_TEXT[p.code] ? ` (${p.message})` : ""}`));
+  box.append(list);
+  return box;
+}
+
+function sxShowValidation(v) {
+  const parts = [];
+  const allowed = v.execution_allowed;
+  parts.push(el("div", allowed ? "muted" : "update warn", allowed
+    ? "Tekshiruvdan o'tdi: bajarishga ruxsat bor (bajarishdan oldin server yana tekshiradi)."
+    : "Rad etildi: bajarib bo'lmaydi."));
+  for (const block of [sxProblems("Xatolar", v.errors), sxProblems("Ogohlantirishlar", v.warnings)]) if (block) parts.push(block);
+  if (v.normalized_sql) {
+    parts.push(el("strong", "", "Aynan shu matn bajariladi"));
+    const pre = el("pre", "sg-sql", v.normalized_sql);
+    pre.id = "sx-normalized";
+    parts.push(pre);
+  }
+  if (v.referenced && v.referenced.tables.length) {
+    parts.push(el("div", "muted", `Ishlatilgan jadvallar: ${v.referenced.tables.map((t) => `${t.schema}.${t.name} (${t.columns.join(", ") || "—"})`).join("; ")}`));
+  }
+  const l = v.limits;
+  parts.push(el("div", "muted", `Chegaralar: ko'pi bilan ${l.max_rows} qator, ${l.timeout_s} soniya, ${Math.round(l.max_result_bytes / 1024)} KB natija.`));
+  const c = v.context;
+  parts.push(el("div", "muted", `Sxema: versiya ${c.snapshot_version}, ${c.selected_objects} tanlangan obyekt; tekshiruv faqat tanlangan jadval va ustunlarga qarab qilindi.`));
+  $("sx-validation").replaceChildren(...parts);
+  $("sx-validation").hidden = false;
+  $("sx-execute").hidden = !allowed;
+  sxState(allowed ? "Holat: tekshirildi, bajarishga ruxsat bor (hali bajarilmagan)" : "Holat: rad etildi", allowed ? "ok" : "bad");
+}
+
+function sxTable(columns, rows) {
+  const table = el("table", "cn-table");
+  const head = el("tr");
+  for (const c of columns) head.append(el("th", "", c.name || " "));
+  table.append(head);
+  for (const row of rows) {
+    const tr = el("tr");
+    for (const value of row) {
+      const td = value === null ? el("td", "muted", "NULL") : el("td", "", typeof value === "string" ? value : JSON.stringify(value));
+      tr.append(td);
+    }
+    table.append(tr);
+  }
+  const wrap = el("div", "sx-table");
+  wrap.append(table);
+  return wrap;
+}
+
+function sxShowResult(r) {
+  const parts = [];
+  parts.push(el("div", r.truncated ? "update warn" : "muted",
+    `Bajarildi: ${r.row_count} qator, ${r.duration_ms} ms${r.truncated ? ` — natija ${r.truncated_by === "bytes" ? "hajm" : "qator"} chegarasida KESILDI: ma'lumotning hammasi ko'rsatilmadi` : ""}.`));
+  for (const w of r.warnings || []) if (w.code !== "result_truncated") parts.push(el("div", "muted", CN_TEXT[w.code] || w.message));
+  parts.push(r.columns.length ? sxTable(r.columns, r.rows) : el("p", "muted", "Natijada ustun yo'q."));
+  if (!r.rows.length && r.columns.length) parts.push(el("p", "muted", "Qator topilmadi."));
+  $("sx-execution").replaceChildren(...parts);
+  $("sx-execution").hidden = false;
+  sxState(`Holat: bajarildi (${r.row_count} qator${r.truncated ? ", kesilgan" : ""})`, r.truncated ? "bad" : "ok");
+}
+
+async function sxValidate() {
+  if (!sxCurrent || sxBusy) return;
+  const id = sgSelected();
+  sxBusy = true;
+  sgError("");
+  $("sx-execute").hidden = true;
+  $("sx-execution").hidden = true;
+  sxState("Holat: tekshirilmoqda…", "ok");
+  try {
+    const result = await cnRun(() => cnApi("POST", `/${id}/sql/validate`, { sql: sxCurrent.sql }), sgError);
+    if (id !== sgSelected() || !sxCurrent) return;
+    if (!result) { sxState("Holat: taklif (tekshirilmagan)", "ok"); await sgFreshness(); return; }
+    sxCurrent.validation = result.data;
+    sxShowValidation(result.data);
+    announce(result.data.execution_allowed ? "SQL tekshiruvdan o'tdi" : "SQL rad etildi");
+  } finally {
+    sxBusy = false;
+  }
+}
+
+async function sxExecute() {
+  if (!sxCurrent || !sxCurrent.validation || !sxCurrent.validation.execution_allowed || sxBusy) return;
+  const id = sgSelected();
+  const c = sxCurrent.validation.context;
+  const expected = { snapshot_fingerprint: c.snapshot_fingerprint, selection_revision: c.selection_revision, target: c.target };
+  sxBusy = true;
+  sgError("");
+  $("sx-execute").disabled = true;
+  sxState("Holat: bajarilmoqda…", "ok");
+  announce("So'rov bajarilmoqda");
+  try {
+    const result = await cnRun(() => cnApi("POST", `/${id}/sql/execute`, { sql: sxCurrent.sql, expected }), sgError);
+    if (id !== sgSelected() || !sxCurrent) return;
+    if (!result) {
+      // whatever went wrong, the earlier validation no longer counts: the person has to validate again
+      sxCurrent.validation = null;
+      $("sx-execute").hidden = true;
+      sxState("Holat: bajarilmadi — qayta tekshiring", "bad");
+      await sgFreshness();
+      return;
+    }
+    sxShowResult(result.data);
+    announce("So'rov bajarildi");
+  } finally {
+    sxBusy = false;
+    $("sx-execute").disabled = false;
+  }
+}
 
 // ----- when the session starts and ends -----
 

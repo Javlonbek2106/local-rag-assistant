@@ -22,7 +22,7 @@ APPLICATION_SIDE = DOCUMENT_SIDE + (
     "rag.reconcile",
 )
 # Third-party libraries of the connector: imported only inside functions, never at the top of a module.
-LAZY_LIBRARIES = ("cryptography", "pytds", "OpenSSL")
+LAZY_LIBRARIES = ("cryptography", "pytds", "OpenSSL", "sqlglot")
 
 
 def imports(path, top_level_only=False):
@@ -147,7 +147,9 @@ def test_sql_generation_cannot_reach_an_external_database_or_the_model_client():
     for path in (PACKAGE / "drivers").glob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         public = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")}
-        assert not {name for name in public if any(w in name for w in ("execute", "query", "run", "fetch"))}, path.name
+        # M4.4: the one function that runs a query is `run`; the others only test a connection and read the catalogue
+        assert not {name for name in public if any(w in name for w in ("execute", "query", "fetch"))}, path.name
+        assert public - {"classify", "test", "introspect", "run"} == set() or path.name == "__init__.py", path.name
 
 
 def test_the_service_hands_the_generator_a_model_function_and_never_imports_one():
@@ -155,3 +157,47 @@ def test_the_service_hands_the_generator_a_model_function_and_never_imports_one(
     assert "sql_completer" in source and not [
         n for n in imports(PACKAGE / "service.py") if starts(n, ("rag.llm", "rag.sqlmodel"))
     ]
+
+
+def calls_of(path, attribute):
+    """The names of the functions of a module in which `.<attribute>(...)` is called."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = set()
+    for function in ast.walk(tree):
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for node in ast.walk(function):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == attribute:
+                    found.add(function.name)
+    return found
+
+
+def test_a_query_is_only_run_by_execute_sql_of_the_service_and_never_from_anywhere_else():
+    """M4.4: `.run(` of a driver is the one way a query reaches an external database. It is called in exactly one
+    function (Service.execute_sql, after the validator and the audit event), in no other module of the connector, and
+    not by
+    the code that generates SQL, the API, the wiring or the model adapter."""
+    for path in list(PACKAGE.rglob("*.py")) + [RAG / "connector_wiring.py", RAG / "sqlmodel.py", RAG / "api.py"]:
+        found = calls_of(path, "run")
+        if path.name == "service.py":
+            assert found == {"execute_sql"}, found
+        elif path.parent.name != "drivers":
+            assert not found, f"{path.relative_to(RAG)} calls .run() in {found}"
+
+
+def test_the_validator_is_pure_it_imports_no_database_driver_network_or_model_client():
+    forbidden = (
+        "rag.connector.drivers",
+        "rag.db",
+        "psycopg",
+        "pytds",
+        "rag.llm",
+        "socket",
+        "http",
+        "urllib",
+        "subprocess",
+    )
+    bad = [n for n in imports(PACKAGE / "sqlcheck.py") if starts(n, forbidden)]
+    assert not bad, bad
+    assert not [
+        n for n in imports(PACKAGE / "sqlcheck.py", top_level_only=True) if starts(n, ("sqlglot",))
+    ]  # lazily imported

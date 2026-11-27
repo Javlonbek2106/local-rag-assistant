@@ -260,6 +260,22 @@ def test_the_internal_database_cannot_be_registered_as_an_external_one():
     assert code(judge, "localhost", 5433, "RAG", "x", addresses=("::1",)) == "internal_database"
 
 
+def test_this_computers_own_network_address_is_the_same_machine_as_localhost(monkeypatch):
+    """The application's database is configured as localhost; the computer's LAN address leads to it as well."""
+    lan = "192.168.50.7"
+    monkeypatch.setattr(network, "_on_this_machine", lambda a: a.is_loopback or str(a) == lan)
+    assert code(judge, lan, 5433, "rag", "someone", addresses=(lan,)) == "internal_database"
+    assert code(judge, lan, 5433, "other", "rag_app", addresses=(lan,)) == "internal_database"
+    assert judge("192.168.50.8", 5433, "rag", "reader", addresses=("192.168.50.8",)).addresses  # another computer
+
+
+def test_which_addresses_are_this_computers_own():
+    import ipaddress
+
+    assert network._on_this_machine(ipaddress.ip_address("127.0.0.1"))
+    assert not network._on_this_machine(ipaddress.ip_address("192.0.2.1"))  # a documentation address: nobody's
+
+
 def test_one_of_the_internal_roles_cannot_be_used_on_the_internal_server():
     for role in ("rag", "rag_app", "rag_migrator", "rag_bootstrap"):
         assert code(judge, "127.0.0.1", 5433, "other_db", role, addresses=("127.0.0.1",)) == "internal_database"

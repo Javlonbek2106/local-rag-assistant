@@ -2,7 +2,7 @@
 
 Manba: [architecture-roadmap.md](architecture-roadmap.md) 6a-bo'lim, [connector.md](connector.md) (ulanishlar, sxema snapshoti, tanlov, kontekst). Bu hujjat M4.3 da **nima qurilganini** tasvirlaydi.
 
-> **Eng muhimi.** M4.3 faqat **yaratadi**. Yaratilgan SQL — **taklif matni**: u **tekshirilmaydi** (SQL tahlili ham, obyektlar mavjudligi ham, SELECT ekani ham) va **hech qachon bajarilmaydi**. Tashqi bazaga generatsiya paytida umuman murojaat qilinmaydi (sxema ichki bazadagi snapshotdan olinadi). Tekshirish va xavfsiz bajarish — **M4.4** va keyingi bosqichlar. Javobdagi `validation: "not_performed"` va `executed: false` maydonlari shuni aniq aytadi.
+> **Eng muhimi.** M4.3 faqat **yaratadi**. Yaratilgan SQL — **taklif matni**: u **tekshirilmaydi** (SQL tahlili ham, obyektlar mavjudligi ham, SELECT ekani ham) va **hech qachon bajarilmaydi**. Tashqi bazaga generatsiya paytida umuman murojaat qilinmaydi (sxema ichki bazadagi snapshotdan olinadi). Tekshirish va xavfsiz bajarish — **M4.4** ([sql-validation.md](sql-validation.md)): u alohida, foydalanuvchi o'zi boshlaydigan operatsiya; generatsiyaning o'zi hech qachon tekshirmaydi va bajarmaydi. Javobdagi `validation: "not_performed"` va `executed: false` maydonlari shuni aniq aytadi.
 
 ## Ish jarayoni
 
@@ -131,7 +131,7 @@ Xatolar `{"error": {"code": …, "reason": …}}`; modelning o'z matni, prompt q
 
 ## Sahifa
 
-**Ulanishlar** bo'limida **Savoldan SQL taklifi** oynasi (kamida bitta yoqilgan ulanish bo'lsa ko'rinadi): ulanishni tanlash, sxema holati qatori (`current`/`stale`/…, versiya), savol maydoni (Ctrl+Enter — yaratish), **SQL yaratish**, natija: holat, dialekt, model, **"tekshirilmagan va bajarilmaydi" ogohlantirishi**, SQL (`<pre>`, matn sifatida), tushuntirish, taxminlar, aniqlanmagan joylar, kontekst qatori (nechta obyekt modelga berilgani, sig'maganlari), **Nusxa olish**. Xatolar so'z bilan shu yerda ko'rsatiladi, `context_stale` bo'lsa sxema holati qatori yangilanadi. Sahifada SQL ni **bajarish tugmasi yo'q**.
+**Ulanishlar** bo'limida **Savoldan SQL taklifi** oynasi (kamida bitta yoqilgan ulanish bo'lsa ko'rinadi): ulanishni tanlash, sxema holati qatori (`current`/`stale`/…, versiya), savol maydoni (Ctrl+Enter — yaratish), **SQL yaratish**, natija: holat, dialekt, model, **"tekshirilmagan va o'zi bajarilmaydi" ogohlantirishi**, SQL (`<pre>`, matn sifatida), tushuntirish, taxminlar, aniqlanmagan joylar, kontekst qatori (nechta obyekt modelga berilgani, sig'maganlari), **Nusxa olish**. Xatolar so'z bilan shu yerda ko'rsatiladi, `context_stale` bo'lsa sxema holati qatori yangilanadi. M4.4 dan beri taklif ostida **Tekshirish** va (muvaffaqiyatli tekshiruvdan keyin) **Bajarish** tugmalari bor: [sql-validation.md](sql-validation.md); generatsiyaning o'zi hech narsa bajarmaydi.
 
 ## Xavfsizlik
 
@@ -153,9 +153,9 @@ Xatolar `{"error": {"code": …, "reason": …}}`; modelning o'z matni, prompt q
 - Bir savolga bitta urinish: avtomatik qayta yozish yoki xatoni tuzatish yo'q.
 - Ikkala dialekt uchun faqat prompt eslatmalari bor; dialektga xos funksiyalar to'g'riligi tekshirilmaydi.
 
-## M4.4 va keyingisiga qoldirilgan
+## M4.4 da qilingan va keyingisiga qoldirilgan
 
-SQL tahlili (AST) va tekshiruvi (faqat bitta `SELECT`, ruxsat etilgan obyektlar, xavfli konstruksiyalar), dushmanona test to'plami, **bajarish** (faqat o'qish bajaruvchi, cheklovlar, vaqt, qatorlar soni), natijani ko'rsatish, so'rov keshi, audit, xatoni avtomatik tuzatish, gibrid RAG. Bular M4.3 da **yo'q** va bajarilgan deb belgilanmaydi.
+SQL tahlili (AST), tekshirish, **bajarish**, natijani ko'rsatish — **M4.4 da qilindi** ([sql-validation.md](sql-validation.md)). M4.3 da ular yo'q edi; hozir ham ular generatsiyaga kirmaydi. Hanuz yo'q: so'rov keshi, so'rovlar tarixi va to'liq audit (M4.5), xatoni avtomatik tuzatish, gibrid RAG.
 
 ## Testlar
 

@@ -169,7 +169,7 @@ def test_sql_server_catalog_queries_are_fixed_text_and_select_only():
         mssql.KEYS,
         mssql.FOREIGN_KEYS,
         mssql.INDEXES,
-        mssql.CAN_WRITE,
+        mssql.CAN_CHANGE_ANYTHING,
         mssql.VERSION,
     ):
         assert sql.lstrip().upper().startswith("SELECT") and ";" not in sql
